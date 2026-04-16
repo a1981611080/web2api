@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gorilla/websocket"
+
 	"web2api/internal/source"
 	"web2api/internal/testutil"
 )
@@ -86,5 +88,53 @@ func TestExecuteChatCompletionWithHostHTTPContinue(t *testing.T) {
 	}
 	if result.Thinking != "http continue reasoning" {
 		t.Fatalf("unexpected thinking: %q", result.Thinking)
+	}
+}
+
+func TestExecuteChatCompletionWithHostWSBridge(t *testing.T) {
+	t.Parallel()
+
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ws" {
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer conn.Close()
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read websocket: %v", err)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			t.Fatalf("write websocket: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	testutil.BuildExampleWSBridgePlugin(t, dir)
+
+	mgr, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := mgr.Scan(); err != nil {
+		t.Fatalf("scan plugins: %v", err)
+	}
+
+	result, err := mgr.ExecuteChatCompletion(context.Background(), "ws-bridge", ChatCompletionRequest{
+		Model:    "ws-test-model",
+		Thinking: false,
+		Messages: []ChatMessage{{Role: "user", Content: "ws test"}},
+	}, source.Config{ID: "grok", Name: "Grok", BaseURL: server.URL}, "acc-ws", "WS Account", map[string]string{})
+	if err != nil {
+		t.Fatalf("execute ws bridge chat completion: %v", err)
+	}
+	if !strings.Contains(result.Content, "ping") {
+		t.Fatalf("expected websocket echoed message, got %q", result.Content)
 	}
 }

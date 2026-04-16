@@ -10,7 +10,6 @@ import (
 	"web2api/internal/account"
 	"web2api/internal/consumer"
 	"web2api/internal/httpapi"
-	"web2api/internal/modelroute"
 	"web2api/internal/plugin"
 	"web2api/internal/source"
 )
@@ -21,7 +20,6 @@ type App struct {
 	sourceStore   *source.Store
 	accountStore  *account.Store
 	consumerStore *consumer.Store
-	modelRoutes   *modelroute.Store
 }
 
 func New() (*App, error) {
@@ -61,12 +59,8 @@ func New() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	modelRoutes, err := modelroute.NewStore(filepath.Join(dataDir, "model_routes.json"))
-	if err != nil {
-		return nil, err
-	}
 
-	h := httpapi.NewHandler(pluginManager, sourceStore, accountStore, consumerStore, modelRoutes, webDir)
+	h := httpapi.NewHandler(pluginManager, sourceStore, accountStore, consumerStore, webDir)
 
 	return &App{
 		router:        h.Router(),
@@ -74,7 +68,6 @@ func New() (*App, error) {
 		sourceStore:   sourceStore,
 		accountStore:  accountStore,
 		consumerStore: consumerStore,
-		modelRoutes:   modelRoutes,
 	}, nil
 }
 

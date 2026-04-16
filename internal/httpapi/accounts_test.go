@@ -7,9 +7,9 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"web2api/internal/account"
+	"web2api/internal/consumer"
 	"web2api/internal/plugin"
 	"web2api/internal/source"
 	"web2api/internal/testutil"
@@ -24,13 +24,11 @@ func TestAdminAccountsLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	sources, _ := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
-	if err := sources.Upsert(source.Config{ID: "grok", Name: "Grok", Enabled: true, Models: []string{"grok-test-model"}, ModelPrefixes: []string{"grok-"}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
 	accounts, _ := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
-	router := NewHandler(mgr, sources, accounts, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
+	consumers, _ := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
+	router := NewHandler(mgr, sources, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
 
-	body, _ := json.Marshal(map[string]any{"id": "acc-1", "source_id": "grok", "name": "Primary", "status": "active", "fields": map[string]string{"access_token": "token-1"}})
+	body, _ := json.Marshal(map[string]any{"id": "acc-1", "plugin_id": "echo", "models": []string{"grok-test-model"}, "name": "Primary", "status": "active", "fields": map[string]string{"access_token": "token-1"}})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/accounts", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
@@ -60,6 +58,14 @@ func TestAdminAccountsLifecycle(t *testing.T) {
 	router.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("mark failure status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/acc-1/validate", bytes.NewReader([]byte(`{"message":"hello"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res = httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("validate account status=%d body=%s", res.Code, res.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodDelete, "/api/admin/accounts/acc-1", nil)

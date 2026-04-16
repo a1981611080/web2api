@@ -41,3 +41,10 @@ func BuildExampleHTTPContinuePlugin(t *testing.T, dir string) string {
 	BuildWASM(t, "./examples/plugins/httpcontinue", path)
 	return path
 }
+
+func BuildExampleWSBridgePlugin(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "ws_bridge.wasm")
+	BuildWASM(t, "./examples/plugins/wsbridge", path)
+	return path
+}

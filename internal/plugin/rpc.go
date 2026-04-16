@@ -70,6 +70,7 @@ type HostRequest struct {
 	ID   string       `json:"id"`
 	Kind string       `json:"kind"`
 	HTTP *HTTPRequest `json:"http,omitempty"`
+	WS   *WSRequest   `json:"ws,omitempty"`
 }
 
 type HTTPRequest struct {
@@ -80,10 +81,21 @@ type HTTPRequest struct {
 	TimeoutMS int               `json:"timeout_ms,omitempty"`
 }
 
+type WSRequest struct {
+	Action      string            `json:"action"`
+	SessionID   string            `json:"session_id,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Message     string            `json:"message,omitempty"`
+	MessageType string            `json:"message_type,omitempty"`
+	TimeoutMS   int               `json:"timeout_ms,omitempty"`
+}
+
 type HostResult struct {
 	ID    string      `json:"id"`
 	Kind  string      `json:"kind"`
 	HTTP  *HTTPResult `json:"http,omitempty"`
+	WS    *WSResult   `json:"ws,omitempty"`
 	Error string      `json:"error,omitempty"`
 }
 
@@ -91,4 +103,11 @@ type HTTPResult struct {
 	StatusCode int                 `json:"status_code"`
 	Headers    map[string][]string `json:"headers,omitempty"`
 	Body       string              `json:"body,omitempty"`
+}
+
+type WSResult struct {
+	SessionID   string `json:"session_id,omitempty"`
+	Connected   bool   `json:"connected,omitempty"`
+	Message     string `json:"message,omitempty"`
+	MessageType string `json:"message_type,omitempty"`
 }

@@ -57,3 +57,21 @@ func TestMarkFailureAndSuccess(t *testing.T) {
 		t.Fatalf("unexpected success state: %#v", item)
 	}
 }
+
+func TestSelectByPluginFallback(t *testing.T) {
+	t.Parallel()
+	store, err := NewStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(Config{ID: "a1", SourceID: "plugin:echo", PluginID: "echo", Status: StatusActive, Priority: 1}); err != nil {
+		t.Fatal(err)
+	}
+	sel, err := store.SelectByPlugin("echo", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel.Account.ID != "a1" {
+		t.Fatalf("expected a1, got %s", sel.Account.ID)
+	}
+}

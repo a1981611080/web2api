@@ -11,11 +11,15 @@ Go-based Web-to-OpenAI API platform with WASM plugin support.
 - platform-owned HTTP host calls for plugins via continue/resume loop
 - source registry in `data/sources.json`
 - account registry in `data/accounts.json`
+- client registry in `data/consumers.json`
+- plugin model catalog endpoint at `/api/admin/catalog/models`
 - admin page at `/admin`
-- admin subpages at `/admin/plugins`, `/admin/sources`, `/admin/accounts`, `/admin/test`, `/admin/status`
+- admin subpages at `/admin/plugins`, `/admin/sources`, `/admin/accounts`, `/admin/clients`, `/admin/test`, `/admin/status`
 - web UI at `/webui`
 - API test page at `/webui/test`
 - OpenAI-style `GET /v1/models`
+- OpenAI-style `GET /v1/models/{id}`
+- OpenAI-style `POST /v1/completions`
 - OpenAI-style `POST /v1/responses`
 - OpenAI-style `POST /v1/chat/completions`
 - streaming SSE placeholder and thinking placeholder

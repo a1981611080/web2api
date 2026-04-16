@@ -10,7 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"web2api/internal/source"
 )
@@ -19,6 +22,8 @@ const (
 	protocolVersion = "web2api.plugin.v1"
 	maxPluginSteps  = 8
 )
+
+var wsBridge = newWSBridge()
 
 func loadManifest(path string) (Manifest, error) {
 	invocation := Invocation{
@@ -188,12 +193,117 @@ func executeHostRequests(ctx context.Context, requests []HostRequest) ([]HostRes
 			}
 			results = append(results, result)
 		case "ws":
-			results = append(results, HostResult{ID: req.ID, Kind: req.Kind, Error: "ws host bridge not implemented yet"})
+			result, err := wsBridge.Execute(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
 		default:
 			results = append(results, HostResult{ID: req.ID, Kind: req.Kind, Error: "unsupported host request kind"})
 		}
 	}
 	return results, nil
+}
+
+type wsBridgeRuntime struct {
+	mu    sync.Mutex
+	conns map[string]*websocket.Conn
+}
+
+func newWSBridge() *wsBridgeRuntime {
+	return &wsBridgeRuntime{conns: map[string]*websocket.Conn{}}
+}
+
+func (b *wsBridgeRuntime) Execute(ctx context.Context, req HostRequest) (HostResult, error) {
+	if req.WS == nil {
+		return HostResult{}, fmt.Errorf("ws request payload missing")
+	}
+	action := strings.ToLower(strings.TrimSpace(req.WS.Action))
+	sessionID := strings.TrimSpace(req.WS.SessionID)
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("ws-%d", time.Now().UnixNano())
+	}
+	switch action {
+	case "connect":
+		dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+		headers := http.Header{}
+		for k, v := range req.WS.Headers {
+			headers.Set(k, v)
+		}
+		conn, _, err := dialer.DialContext(ctx, req.WS.URL, headers)
+		if err != nil {
+			return HostResult{ID: req.ID, Kind: req.Kind, Error: err.Error()}, nil
+		}
+		b.mu.Lock()
+		b.conns[sessionID] = conn
+		b.mu.Unlock()
+		return HostResult{ID: req.ID, Kind: req.Kind, WS: &WSResult{SessionID: sessionID, Connected: true}}, nil
+	case "send":
+		conn, ok := b.get(sessionID)
+		if !ok {
+			return HostResult{ID: req.ID, Kind: req.Kind, Error: "ws session not found"}, nil
+		}
+		msgType := websocket.TextMessage
+		if strings.EqualFold(req.WS.MessageType, "binary") {
+			msgType = websocket.BinaryMessage
+		}
+		if err := conn.WriteMessage(msgType, []byte(req.WS.Message)); err != nil {
+			_ = b.close(sessionID)
+			return HostResult{ID: req.ID, Kind: req.Kind, Error: err.Error()}, nil
+		}
+		outType := "text"
+		if msgType == websocket.BinaryMessage {
+			outType = "binary"
+		}
+		return HostResult{ID: req.ID, Kind: req.Kind, WS: &WSResult{SessionID: sessionID, MessageType: outType}}, nil
+	case "recv":
+		conn, ok := b.get(sessionID)
+		if !ok {
+			return HostResult{ID: req.ID, Kind: req.Kind, Error: "ws session not found"}, nil
+		}
+		timeout := 30 * time.Second
+		if req.WS.TimeoutMS > 0 {
+			timeout = time.Duration(req.WS.TimeoutMS) * time.Millisecond
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			_ = b.close(sessionID)
+			return HostResult{ID: req.ID, Kind: req.Kind, Error: err.Error()}, nil
+		}
+		outType := "text"
+		if messageType == websocket.BinaryMessage {
+			outType = "binary"
+		}
+		return HostResult{ID: req.ID, Kind: req.Kind, WS: &WSResult{SessionID: sessionID, Message: string(payload), MessageType: outType}}, nil
+	case "close":
+		if err := b.close(sessionID); err != nil {
+			return HostResult{ID: req.ID, Kind: req.Kind, Error: err.Error()}, nil
+		}
+		return HostResult{ID: req.ID, Kind: req.Kind, WS: &WSResult{SessionID: sessionID}}, nil
+	default:
+		return HostResult{ID: req.ID, Kind: req.Kind, Error: "unsupported ws action"}, nil
+	}
+}
+
+func (b *wsBridgeRuntime) get(sessionID string) (*websocket.Conn, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	conn, ok := b.conns[sessionID]
+	return conn, ok
+}
+
+func (b *wsBridgeRuntime) close(sessionID string) error {
+	b.mu.Lock()
+	conn, ok := b.conns[sessionID]
+	if ok {
+		delete(b.conns, sessionID)
+	}
+	b.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("ws session not found")
+	}
+	return conn.Close()
 }
 
 func executeHTTPRequest(ctx context.Context, req HostRequest) (HostResult, error) {

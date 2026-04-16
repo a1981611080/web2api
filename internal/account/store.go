@@ -87,6 +87,14 @@ func (s *Store) Upsert(cfg Config) error {
 
 	for i := range s.items {
 		if s.items[i].ID == cfg.ID {
+			if cfg.Fields == nil {
+				cfg.Fields = map[string]string{}
+			}
+			for k, v := range s.items[i].Fields {
+				if _, ok := cfg.Fields[k]; !ok || cfg.Fields[k] == "" {
+					cfg.Fields[k] = v
+				}
+			}
 			cfg.CreatedAt = s.items[i].CreatedAt
 			s.items[i] = cfg
 			return s.saveLocked()
@@ -99,11 +107,28 @@ func (s *Store) Upsert(cfg Config) error {
 func (s *Store) Select(sourceID string, now time.Time) (Selection, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	best := selectBest(s.items, func(item Config) bool { return item.SourceID == sourceID }, now)
+	if best == nil {
+		return Selection{}, fmt.Errorf("no available account for source %q", sourceID)
+	}
+	return Selection{Account: *best, Reason: "selected available account"}, nil
+}
 
+func (s *Store) SelectByPlugin(pluginID string, now time.Time) (Selection, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best := selectBest(s.items, func(item Config) bool { return item.PluginID == pluginID }, now)
+	if best == nil {
+		return Selection{}, fmt.Errorf("no available account for plugin %q", pluginID)
+	}
+	return Selection{Account: *best, Reason: "selected available plugin account"}, nil
+}
+
+func selectBest(items []Config, filter func(Config) bool, now time.Time) *Config {
 	var best *Config
-	for i := range s.items {
-		item := s.items[i]
-		if item.SourceID != sourceID {
+	for i := range items {
+		item := items[i]
+		if !filter(item) {
 			continue
 		}
 		if item.Status == StatusDisabled {
@@ -120,10 +145,7 @@ func (s *Store) Select(sourceID string, now time.Time) (Selection, error) {
 			best = &candidate
 		}
 	}
-	if best == nil {
-		return Selection{}, fmt.Errorf("no available account for source %q", sourceID)
-	}
-	return Selection{Account: *best, Reason: "selected available account"}, nil
+	return best
 }
 
 func lessUsed(a, b Config) bool {
@@ -190,4 +212,15 @@ func (s *Store) Delete(id string) error {
 		}
 	}
 	return fmt.Errorf("account %q not found", id)
+}
+
+func (s *Store) Find(id string) (Config, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, item := range s.items {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return Config{}, fmt.Errorf("account %q not found", id)
 }

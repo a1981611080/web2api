@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"web2api/internal/account"
+	"web2api/internal/consumer"
 	"web2api/internal/plugin"
 	"web2api/internal/source"
 	"web2api/internal/testutil"
@@ -111,6 +112,64 @@ func TestListModelsFromPluginManifest(t *testing.T) {
 	}
 }
 
+func TestGetModelByID(t *testing.T) {
+	t.Parallel()
+	router := newTestRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/grok-test-model", nil)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode model response: %v", err)
+	}
+	if payload["id"] != "grok-test-model" {
+		t.Fatalf("unexpected model id: %#v", payload["id"])
+	}
+}
+
+func TestCompletionsEndpoint(t *testing.T) {
+	t.Parallel()
+	router := newTestRouter(t)
+	payload, _ := json.Marshal(map[string]any{
+		"model":  "grok-test-model",
+		"prompt": "hello completion",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode completions body: %v", err)
+	}
+	if body["object"] != "text_completion" {
+		t.Fatalf("unexpected object: %#v", body["object"])
+	}
+}
+
+func TestChatCompletionsContentArrayCompatibility(t *testing.T) {
+	t.Parallel()
+	router := newTestRouter(t)
+	body := map[string]any{
+		"model":  "grok-test-model",
+		"stream": false,
+		"messages": []map[string]any{{
+			"role":    "user",
+			"content": []map[string]any{{"type": "text", "text": "hello array content"}},
+		}},
+	}
+	res := performJSONRequest(t, router, body)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
 func TestResponsesJSONResponseFromPlugin(t *testing.T) {
 	t.Parallel()
 	router := newTestRouter(t)
@@ -171,6 +230,136 @@ func TestDeleteSource(t *testing.T) {
 	}
 }
 
+func TestValidateSourceEndpoint(t *testing.T) {
+	t.Parallel()
+	router := newTestRouter(t)
+	payload, _ := json.Marshal(map[string]any{"message": "hello validate"})
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/sources/grok/validate", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode validate response: %v", err)
+	}
+	if ok, _ := body["ok"].(bool); !ok {
+		t.Fatalf("expected ok=true, got %#v", body)
+	}
+}
+
+func TestClientAPIKeyAndModelActivation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	testutil.BuildExampleEchoPlugin(t, dir)
+	mgr, err := plugin.NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Scan(); err != nil {
+		t.Fatal(err)
+	}
+
+	sources, _ := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
+	if err := sources.Upsert(source.Config{ID: "grok", Name: "Grok", PluginID: "echo", Enabled: true, Models: []string{"grok-test-model"}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	accounts, _ := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err := accounts.Upsert(account.Config{ID: "acc-1", SourceID: "grok", Name: "Primary", Status: account.StatusActive, Fields: map[string]string{"access_token": "token-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	consumers, _ := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
+	if err := consumers.Upsert(consumer.Config{ID: "c1", Name: "Client One", APIKey: "sk-test-1", Enabled: true, AllowedModels: []string{"grok-test-model"}}); err != nil {
+		t.Fatal(err)
+	}
+	router := NewHandler(mgr, sources, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without api key, got %d", res.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-test-1")
+	res = httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200 with api key, got %d body=%s", res.Code, res.Body.String())
+	}
+
+	payload, _ := json.Marshal(map[string]any{"model": "grok-test-model", "messages": []map[string]string{{"role": "user", "content": "route test"}}})
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer sk-test-1")
+	req.Header.Set("Content-Type", "application/json")
+	res = httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200 for routed model, got %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestChatCompletionsToolCallsCompatibility(t *testing.T) {
+	t.Parallel()
+	router := newToolCallsRouter(t)
+	body := map[string]any{
+		"model":    "tool-model",
+		"stream":   false,
+		"thinking": false,
+		"messages": []map[string]string{{"role": "user", "content": "search something"}},
+	}
+	res := performJSONRequest(t, router, body)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	choices := payload["choices"].([]any)
+	choice := choices[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("unexpected finish_reason: %#v", choice["finish_reason"])
+	}
+	message := choice["message"].(map[string]any)
+	if _, ok := message["tool_calls"]; !ok {
+		t.Fatalf("expected tool_calls in message, got %#v", message)
+	}
+}
+
+func TestResponsesToolCallsCompatibility(t *testing.T) {
+	t.Parallel()
+	router := newToolCallsRouter(t)
+	payload, _ := json.Marshal(map[string]any{
+		"model":  "tool-model",
+		"input":  "search",
+		"stream": false,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	output := body["output"].([]any)
+	if len(output) == 0 {
+		t.Fatalf("expected output items, got %#v", body)
+	}
+	first := output[0].(map[string]any)
+	if first["type"] != "function_call" {
+		t.Fatalf("expected function_call, got %#v", first["type"])
+	}
+}
+
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
 	dir := t.TempDir()
@@ -210,9 +399,45 @@ func newTestRouter(t *testing.T) http.Handler {
 	if err := accounts.Upsert(account.Config{ID: "acc-1", SourceID: "grok", Name: "Primary", Status: account.StatusActive, Fields: map[string]string{"access_token": "token-1"}}); err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
-
+	consumers, err := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
+	if err != nil {
+		t.Fatalf("new consumer store: %v", err)
+	}
 	webDir := filepath.Join(testutil.ProjectRoot(t), "web")
-	return NewHandler(mgr, store, accounts, webDir).Router()
+	return NewHandler(mgr, store, accounts, consumers, webDir).Router()
+}
+
+func newToolCallsRouter(t *testing.T) http.Handler {
+	t.Helper()
+	dir := t.TempDir()
+	testutil.BuildWASM(t, "./examples/plugins/toolcalls", filepath.Join(dir, "toolcalls.wasm"))
+
+	mgr, err := plugin.NewManager(dir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := mgr.Scan(); err != nil {
+		t.Fatalf("scan plugins: %v", err)
+	}
+	store, err := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
+	if err != nil {
+		t.Fatalf("new source store: %v", err)
+	}
+	if err := store.Upsert(source.Config{ID: "tool", Name: "Tool", PluginID: "toolcalls", Enabled: true, Models: []string{"tool-model"}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("upsert source: %v", err)
+	}
+	accounts, err := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
+	if err != nil {
+		t.Fatalf("new account store: %v", err)
+	}
+	if err := accounts.Upsert(account.Config{ID: "acc-1", SourceID: "tool", Name: "Primary", Status: account.StatusActive}); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	consumers, err := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
+	if err != nil {
+		t.Fatalf("new consumer store: %v", err)
+	}
+	return NewHandler(mgr, store, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
 }
 
 func performJSONRequest(t *testing.T, router http.Handler, body map[string]any) *httptest.ResponseRecorder {

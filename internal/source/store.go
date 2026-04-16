@@ -94,6 +94,9 @@ func (s *Store) FindByModel(model string) (Config, error) {
 	defer s.mu.RUnlock()
 
 	for _, item := range s.items {
+		if !strings.HasPrefix(item.ID, "plugin:") {
+			continue
+		}
 		if !item.Enabled {
 			continue
 		}

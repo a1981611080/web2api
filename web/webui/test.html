@@ -8,7 +8,7 @@
     body { font-family: Arial, sans-serif; margin: 24px; background: #020617; color: #e2e8f0; }
     .wrap { max-width: 960px; margin: 0 auto; }
     .panel { background: #0f172a; border: 1px solid #1e293b; border-radius: 14px; padding: 20px; }
-    textarea, input { width: 100%; box-sizing: border-box; margin-top: 8px; margin-bottom: 14px; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #fff; }
+    textarea, input, select { width: 100%; box-sizing: border-box; margin-top: 8px; margin-bottom: 14px; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #fff; }
     button { background: #22c55e; color: #04130a; border: 0; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-weight: bold; }
     pre { white-space: pre-wrap; word-break: break-word; background: #000; padding: 12px; border-radius: 8px; min-height: 200px; }
   </style>
@@ -17,8 +17,12 @@
   <div class="wrap">
     <div class="panel">
       <h1>转换 API 测试</h1>
+      <label>客户端 API Key（可选）</label>
+      <input id="api-key" placeholder="sk-... 如需鉴权请填写">
+
       <label>模型</label>
-      <input id="model" value="grok-test-model">
+      <select id="model"></select>
+      <button id="reload-models" type="button" style="margin-top:-4px; margin-bottom:14px;">刷新模型</button>
 
       <label>消息</label>
       <textarea id="message" rows="6">你好，介绍一下你自己</textarea>
@@ -36,12 +40,32 @@
 
   <script>
     const output = document.getElementById('output');
+    const modelSelect = document.getElementById('model');
+    const apiKeyInput = document.getElementById('api-key');
+
+    async function loadModels() {
+      const headers = {};
+      if (apiKeyInput.value.trim()) {
+        headers.Authorization = `Bearer ${apiKeyInput.value.trim()}`;
+      }
+      const res = await fetch('/v1/models', { headers });
+      const data = await res.json();
+      const models = data.data || [];
+      modelSelect.innerHTML = models.map((item) => `<option value="${item.id}">${item.id}</option>`).join('');
+      if (!models.length) {
+        modelSelect.innerHTML = '<option value="">(暂无可用模型)</option>';
+      }
+    }
+
+    document.getElementById('reload-models').addEventListener('click', async () => {
+      await loadModels();
+    });
 
     document.getElementById('send').addEventListener('click', async () => {
       output.textContent = '';
 
       const payload = {
-        model: document.getElementById('model').value,
+        model: modelSelect.value,
         stream: document.getElementById('stream').checked,
         thinking: document.getElementById('thinking').checked,
         messages: [
@@ -49,9 +73,14 @@
         ]
       };
 
+      const headers = { 'Content-Type': 'application/json' };
+      if (apiKeyInput.value.trim()) {
+        headers.Authorization = `Bearer ${apiKeyInput.value.trim()}`;
+      }
+
       const res = await fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(payload)
       });
 
@@ -68,6 +97,8 @@
         output.textContent += decoder.decode(value, { stream: true });
       }
     });
+
+    loadModels();
   </script>
 </body>
 </html>
