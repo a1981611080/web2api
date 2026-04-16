@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>API Test</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #020617; color: #e2e8f0; }
+    .wrap { max-width: 960px; margin: 0 auto; }
+    .panel { background: #0f172a; border: 1px solid #1e293b; border-radius: 14px; padding: 20px; }
+    textarea, input { width: 100%; box-sizing: border-box; margin-top: 8px; margin-bottom: 14px; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #fff; }
+    button { background: #22c55e; color: #04130a; border: 0; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #000; padding: 12px; border-radius: 8px; min-height: 200px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>转换 API 测试</h1>
+      <label>模型</label>
+      <input id="model" value="grok-test-model">
+
+      <label>消息</label>
+      <textarea id="message" rows="6">你好，介绍一下你自己</textarea>
+
+      <label><input type="checkbox" id="stream" checked> 流式返回</label>
+      <label><input type="checkbox" id="thinking"> thinking 输出</label>
+
+      <div style="margin-top: 12px; margin-bottom: 12px;">
+        <button id="send">发送</button>
+      </div>
+
+      <pre id="output"></pre>
+    </div>
+  </div>
+
+  <script>
+    const output = document.getElementById('output');
+
+    document.getElementById('send').addEventListener('click', async () => {
+      output.textContent = '';
+
+      const payload = {
+        model: document.getElementById('model').value,
+        stream: document.getElementById('stream').checked,
+        thinking: document.getElementById('thinking').checked,
+        messages: [
+          { role: 'user', content: document.getElementById('message').value }
+        ]
+      };
+
+      const res = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!payload.stream) {
+        output.textContent = JSON.stringify(await res.json(), null, 2);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        output.textContent += decoder.decode(value, { stream: true });
+      }
+    });
+  </script>
+</body>
+</html>
