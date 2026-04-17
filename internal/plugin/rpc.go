@@ -32,11 +32,24 @@ type AccountConfig struct {
 }
 
 type ChatCompletionRequest struct {
-	Model    string            `json:"model"`
-	Messages []ChatMessage     `json:"messages"`
-	Stream   bool              `json:"stream"`
-	Thinking bool              `json:"thinking"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Model      string            `json:"model"`
+	Messages   []ChatMessage     `json:"messages"`
+	Stream     bool              `json:"stream"`
+	Thinking   bool              `json:"thinking"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	Tools      []Tool            `json:"tools,omitempty"`
+	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
+}
+
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 type ChatMessage struct {
@@ -48,9 +61,16 @@ type Output struct {
 	Type     string                `json:"type"`
 	Manifest *Manifest             `json:"manifest,omitempty"`
 	Response *ChatCompletionResult `json:"response,omitempty"`
+	Chunk    *ChatCompletionChunk  `json:"chunk,omitempty"`
 	Requests []HostRequest         `json:"requests,omitempty"`
 	State    json.RawMessage       `json:"state,omitempty"`
 	Error    string                `json:"error,omitempty"`
+}
+
+type ChatCompletionChunk struct {
+	Content  string `json:"content,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+	Raw      any    `json:"raw,omitempty"`
 }
 
 type ChatCompletionResult struct {
@@ -74,10 +94,14 @@ type HostRequest struct {
 }
 
 type HTTPRequest struct {
+	Action    string            `json:"action,omitempty"`
+	SessionID string            `json:"session_id,omitempty"`
 	Method    string            `json:"method"`
 	URL       string            `json:"url"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	Body      string            `json:"body,omitempty"`
+	Stream    bool              `json:"stream,omitempty"`
+	ChunkSize int               `json:"chunk_size,omitempty"`
 	TimeoutMS int               `json:"timeout_ms,omitempty"`
 }
 
@@ -103,6 +127,9 @@ type HTTPResult struct {
 	StatusCode int                 `json:"status_code"`
 	Headers    map[string][]string `json:"headers,omitempty"`
 	Body       string              `json:"body,omitempty"`
+	Chunks     []string            `json:"chunks,omitempty"`
+	StreamID   string              `json:"stream_id,omitempty"`
+	Done       bool                `json:"done,omitempty"`
 }
 
 type WSResult struct {

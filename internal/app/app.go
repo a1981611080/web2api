@@ -11,13 +11,11 @@ import (
 	"web2api/internal/consumer"
 	"web2api/internal/httpapi"
 	"web2api/internal/plugin"
-	"web2api/internal/source"
 )
 
 type App struct {
 	router        chi.Router
 	pluginManager *plugin.Manager
-	sourceStore   *source.Store
 	accountStore  *account.Store
 	consumerStore *consumer.Store
 }
@@ -47,10 +45,6 @@ func New() (*App, error) {
 		return nil, err
 	}
 
-	sourceStore, err := source.NewStore(filepath.Join(dataDir, "sources.json"))
-	if err != nil {
-		return nil, err
-	}
 	accountStore, err := account.NewStore(filepath.Join(dataDir, "accounts.json"))
 	if err != nil {
 		return nil, err
@@ -60,12 +54,11 @@ func New() (*App, error) {
 		return nil, err
 	}
 
-	h := httpapi.NewHandler(pluginManager, sourceStore, accountStore, consumerStore, webDir)
+	h := httpapi.NewHandler(pluginManager, accountStore, consumerStore, webDir)
 
 	return &App{
 		router:        h.Router(),
 		pluginManager: pluginManager,
-		sourceStore:   sourceStore,
 		accountStore:  accountStore,
 		consumerStore: consumerStore,
 	}, nil

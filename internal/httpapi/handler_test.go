@@ -8,12 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"web2api/internal/account"
 	"web2api/internal/consumer"
 	"web2api/internal/plugin"
-	"web2api/internal/source"
 	"web2api/internal/testutil"
 )
 
@@ -205,51 +203,6 @@ func TestResponsesJSONResponseFromPlugin(t *testing.T) {
 	}
 }
 
-func TestDeleteSource(t *testing.T) {
-	t.Parallel()
-	router := newTestRouter(t)
-	req := httptest.NewRequest(http.MethodDelete, "/api/admin/sources/grok", nil)
-	res := httptest.NewRecorder()
-	router.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
-		t.Fatalf("delete source status=%d body=%s", res.Code, res.Body.String())
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/api/admin/sources", nil)
-	res = httptest.NewRecorder()
-	router.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
-		t.Fatalf("list sources status=%d", res.Code)
-	}
-	var payload map[string][]map[string]any
-	if err := json.Unmarshal(res.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode sources payload: %v", err)
-	}
-	if len(payload["data"]) != 0 {
-		t.Fatalf("expected 0 source after delete, got %d", len(payload["data"]))
-	}
-}
-
-func TestValidateSourceEndpoint(t *testing.T) {
-	t.Parallel()
-	router := newTestRouter(t)
-	payload, _ := json.Marshal(map[string]any{"message": "hello validate"})
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/sources/grok/validate", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	res := httptest.NewRecorder()
-	router.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", res.Code, res.Body.String())
-	}
-	var body map[string]any
-	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode validate response: %v", err)
-	}
-	if ok, _ := body["ok"].(bool); !ok {
-		t.Fatalf("expected ok=true, got %#v", body)
-	}
-}
-
 func TestClientAPIKeyAndModelActivation(t *testing.T) {
 	t.Parallel()
 
@@ -263,19 +216,15 @@ func TestClientAPIKeyAndModelActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sources, _ := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
-	if err := sources.Upsert(source.Config{ID: "grok", Name: "Grok", PluginID: "echo", Enabled: true, Models: []string{"grok-test-model"}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
 	accounts, _ := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
-	if err := accounts.Upsert(account.Config{ID: "acc-1", SourceID: "grok", Name: "Primary", Status: account.StatusActive, Fields: map[string]string{"access_token": "token-1"}}); err != nil {
+	if err := accounts.Upsert(account.Config{ID: "acc-1", PluginID: "echo", Name: "Primary", Status: account.StatusActive, Fields: map[string]string{"access_token": "token-1"}}); err != nil {
 		t.Fatal(err)
 	}
 	consumers, _ := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
 	if err := consumers.Upsert(consumer.Config{ID: "c1", Name: "Client One", APIKey: "sk-test-1", Enabled: true, AllowedModels: []string{"grok-test-model"}}); err != nil {
 		t.Fatal(err)
 	}
-	router := NewHandler(mgr, sources, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
+	router := NewHandler(mgr, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	res := httptest.NewRecorder()
@@ -376,27 +325,11 @@ func newTestRouter(t *testing.T) http.Handler {
 		t.Fatalf("expected echo plugin after scan, got %#v", mgr.List())
 	}
 
-	store, err := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
-	if err != nil {
-		t.Fatalf("new source store: %v", err)
-	}
-	if err := store.Upsert(source.Config{
-		ID:            "grok",
-		Name:          "Grok",
-		PluginID:      "echo",
-		Enabled:       true,
-		Models:        []string{"grok-test-model"},
-		ModelPrefixes: []string{"grok-"},
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
-	}); err != nil {
-		t.Fatalf("upsert source: %v", err)
-	}
 	accounts, err := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
 	if err != nil {
 		t.Fatalf("new account store: %v", err)
 	}
-	if err := accounts.Upsert(account.Config{ID: "acc-1", SourceID: "grok", Name: "Primary", Status: account.StatusActive, Fields: map[string]string{"access_token": "token-1"}}); err != nil {
+	if err := accounts.Upsert(account.Config{ID: "acc-1", PluginID: "echo", Name: "Primary", Status: account.StatusActive, Fields: map[string]string{"access_token": "token-1"}}); err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
 	consumers, err := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
@@ -404,7 +337,7 @@ func newTestRouter(t *testing.T) http.Handler {
 		t.Fatalf("new consumer store: %v", err)
 	}
 	webDir := filepath.Join(testutil.ProjectRoot(t), "web")
-	return NewHandler(mgr, store, accounts, consumers, webDir).Router()
+	return NewHandler(mgr, accounts, consumers, webDir).Router()
 }
 
 func newToolCallsRouter(t *testing.T) http.Handler {
@@ -419,25 +352,18 @@ func newToolCallsRouter(t *testing.T) http.Handler {
 	if err := mgr.Scan(); err != nil {
 		t.Fatalf("scan plugins: %v", err)
 	}
-	store, err := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
-	if err != nil {
-		t.Fatalf("new source store: %v", err)
-	}
-	if err := store.Upsert(source.Config{ID: "tool", Name: "Tool", PluginID: "toolcalls", Enabled: true, Models: []string{"tool-model"}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}); err != nil {
-		t.Fatalf("upsert source: %v", err)
-	}
 	accounts, err := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
 	if err != nil {
 		t.Fatalf("new account store: %v", err)
 	}
-	if err := accounts.Upsert(account.Config{ID: "acc-1", SourceID: "tool", Name: "Primary", Status: account.StatusActive}); err != nil {
+	if err := accounts.Upsert(account.Config{ID: "acc-1", PluginID: "toolcalls", Name: "Primary", Status: account.StatusActive}); err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
 	consumers, err := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
 	if err != nil {
 		t.Fatalf("new consumer store: %v", err)
 	}
-	return NewHandler(mgr, store, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
+	return NewHandler(mgr, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
 }
 
 func performJSONRequest(t *testing.T, router http.Handler, body map[string]any) *httptest.ResponseRecorder {

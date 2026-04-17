@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,14 +24,30 @@ import (
 
 type Handler struct {
 	plugins   *plugin.Manager
-	sources   *source.Store
 	accounts  *account.Store
 	consumers *consumer.Store
 	webDir    string
+	toolLogMu sync.Mutex
+	toolLogs  []toolCallLogEntry
 }
 
-func NewHandler(plugins *plugin.Manager, sources *source.Store, accounts *account.Store, consumers *consumer.Store, webDir string) *Handler {
-	return &Handler{plugins: plugins, sources: sources, accounts: accounts, consumers: consumers, webDir: webDir}
+func NewHandler(plugins *plugin.Manager, accounts *account.Store, consumers *consumer.Store, webDir string) *Handler {
+	return &Handler{plugins: plugins, accounts: accounts, consumers: consumers, webDir: webDir}
+}
+
+type toolCallLogEntry struct {
+	At         string `json:"at"`
+	RequestID  string `json:"request_id,omitempty"`
+	Model      string `json:"model"`
+	Stream     bool   `json:"stream"`
+	ToolChoice string `json:"tool_choice,omitempty"`
+	ToolCount  int    `json:"tool_count"`
+	Request    string `json:"request_preview,omitempty"`
+	Finish     string `json:"finish_reason,omitempty"`
+	ToolCalls  int    `json:"tool_calls"`
+	Content    string `json:"content_preview,omitempty"`
+	Raw        string `json:"raw_preview,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 func (h *Handler) Router() chi.Router {
@@ -49,12 +67,16 @@ func (h *Handler) Router() chi.Router {
 	r.Get("/admin/clients", h.serveFile("admin/clients.html"))
 	r.Get("/admin/test", h.serveFile("admin/test.html"))
 	r.Get("/admin/status", h.serveFile("admin/status.html"))
+	r.Get("/admin/runtime", h.serveFile("admin/runtime.html"))
+	r.Get("/admin/tool-calls", h.serveFile("admin/tool-calls.html"))
 	r.Get("/webui", h.serveFile("webui/index.html"))
 	r.Get("/webui/test", h.serveFile("webui/test.html"))
 	r.Handle("/assets/*", http.StripPrefix("/assets/", http.FileServer(http.Dir(filepath.Join(h.webDir, "assets")))))
 
 	r.Route("/api/admin", func(r chi.Router) {
 		r.Get("/status", h.adminStatus)
+		r.Get("/runtime", h.runtimeStatus)
+		r.Get("/tool-calls", h.toolCallLogs)
 		r.Get("/plugins", h.listPlugins)
 		r.Post("/plugins/scan", h.scanPlugins)
 		r.Get("/accounts", h.listAccounts)
@@ -90,14 +112,12 @@ func (h *Handler) listPlugins(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) adminStatus(w http.ResponseWriter, r *http.Request) {
 	plugins := h.plugins.List()
-	sources := h.sources.List()
 	readyPlugins := 0
 	for _, item := range plugins {
 		if item.Status == "ready" {
 			readyPlugins++
 		}
 	}
-	enabledSources := 0
 	accounts := h.accounts.List()
 	consumers := h.consumers.List()
 	catalogModels := h.collectCatalogModels()
@@ -114,11 +134,6 @@ func (h *Handler) adminStatus(w http.ResponseWriter, r *http.Request) {
 			activeAccounts++
 		}
 	}
-	for _, item := range sources {
-		if item.Enabled {
-			enabledSources++
-		}
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": map[string]any{
 			"name":   "web2api",
@@ -127,11 +142,6 @@ func (h *Handler) adminStatus(w http.ResponseWriter, r *http.Request) {
 		"plugins": map[string]any{
 			"total": readyPlugins,
 			"items": plugins,
-		},
-		"sources": map[string]any{
-			"total":   len(sources),
-			"enabled": enabledSources,
-			"items":   sources,
 		},
 		"accounts": map[string]any{
 			"total":    activeAccounts + coolingAccounts + disabledAccounts,
@@ -149,13 +159,31 @@ func (h *Handler) adminStatus(w http.ResponseWriter, r *http.Request) {
 			"items": catalogModels,
 		},
 		"routes": map[string]string{
-			"plugins":  "/admin/plugins",
-			"accounts": "/admin/accounts",
-			"clients":  "/admin/clients",
-			"models":   "/api/admin/catalog/models",
-			"test":     "/admin/test",
-			"status":   "/admin/status",
+			"plugins":    "/admin/plugins",
+			"accounts":   "/admin/accounts",
+			"clients":    "/admin/clients",
+			"models":     "/api/admin/catalog/models",
+			"test":       "/admin/test",
+			"status":     "/admin/status",
+			"runtime":    "/admin/runtime",
+			"tool_calls": "/admin/tool-calls",
 		},
+	})
+}
+
+func (h *Handler) toolCallLogs(w http.ResponseWriter, r *http.Request) {
+	h.toolLogMu.Lock()
+	items := append([]toolCallLogEntry(nil), h.toolLogs...)
+	h.toolLogMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"total": len(items), "items": items})
+}
+
+func (h *Handler) runtimeStatus(w http.ResponseWriter, r *http.Request) {
+	items := h.plugins.ProcessPoolSnapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"now":   time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"total": len(items),
+		"items": items,
 	})
 }
 
@@ -256,10 +284,6 @@ func (h *Handler) upsertAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := h.syncSourceForPlugin(req.PluginID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
 	writeJSON(w, http.StatusOK, req)
 }
 
@@ -322,13 +346,9 @@ func (h *Handler) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("accountID is required"))
 		return
 	}
-	item, findErr := h.accounts.Find(accountID)
 	if err := h.accounts.Delete(accountID); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
-	}
-	if findErr == nil && strings.TrimSpace(item.PluginID) != "" {
-		_ = h.syncSourceForPlugin(item.PluginID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -344,7 +364,7 @@ func (h *Handler) validateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("account plugin_id is empty"))
 		return
 	}
-	src, srcErr := findSourceByID(h.sources.List(), sourceIDForPlugin(item.PluginID))
+	src, srcErr := h.resolveSourceForPlugin(item.PluginID)
 	if srcErr != nil {
 		writeError(w, http.StatusBadRequest, srcErr)
 		return
@@ -360,8 +380,13 @@ func (h *Handler) validateAccount(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		if len(item.Models) > 0 {
 			model = item.Models[0]
-		} else if len(src.Models) > 0 {
-			model = src.Models[0]
+		} else {
+			for _, m := range h.collectCatalogModels() {
+				if m.PluginID == item.PluginID {
+					model = m.ID
+					break
+				}
+			}
 		}
 	}
 	if model == "" {
@@ -390,55 +415,6 @@ func (h *Handler) validateAccount(w http.ResponseWriter, r *http.Request) {
 
 func sourceIDForPlugin(pluginID string) string {
 	return "plugin:" + strings.TrimSpace(pluginID)
-}
-
-func (h *Handler) syncSourceForPlugin(pluginID string) error {
-	pluginID = strings.TrimSpace(pluginID)
-	if pluginID == "" {
-		return nil
-	}
-	modelSet := map[string]bool{}
-	validation := ""
-	enabled := false
-	for _, acc := range h.accounts.List() {
-		if strings.TrimSpace(acc.PluginID) != pluginID {
-			continue
-		}
-		if acc.Status != account.StatusDisabled {
-			enabled = true
-		}
-		for _, m := range acc.Models {
-			modelSet[m] = true
-		}
-		if validation == "" && strings.TrimSpace(acc.ValidationMessage) != "" {
-			validation = strings.TrimSpace(acc.ValidationMessage)
-		}
-	}
-	models := make([]string, 0, len(modelSet))
-	for m := range modelSet {
-		models = append(models, m)
-	}
-	sort.Strings(models)
-	src := source.Config{
-		ID:                sourceIDForPlugin(pluginID),
-		Name:              pluginID,
-		PluginID:          pluginID,
-		Enabled:           enabled,
-		Models:            models,
-		ValidationMessage: validation,
-		CreatedAt:         time.Now().UTC(),
-		UpdatedAt:         time.Now().UTC(),
-	}
-	return h.sources.Upsert(src)
-}
-
-func sourceExists(items []source.Config, id string) bool {
-	for _, item := range items {
-		if item.ID == id {
-			return true
-		}
-	}
-	return false
 }
 
 func (h *Handler) markAccountSuccess(w http.ResponseWriter, r *http.Request) {
@@ -478,122 +454,6 @@ func (h *Handler) scanPlugins(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": h.plugins.List()})
 }
 
-func (h *Handler) listSources(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"data": h.sources.List()})
-}
-
-func (h *Handler) upsertSource(w http.ResponseWriter, r *http.Request) {
-	var req source.Config
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if strings.TrimSpace(req.ID) == "" {
-		writeError(w, http.StatusBadRequest, errors.New("id is required"))
-		return
-	}
-	if strings.TrimSpace(req.Name) == "" {
-		req.Name = req.ID
-	}
-	if strings.TrimSpace(req.ValidationMessage) == "" {
-		req.ValidationMessage = "你好，请回复ok"
-	}
-	if req.PluginID != "" && !h.plugins.Exists(req.PluginID) {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("plugin %q not found", req.PluginID))
-		return
-	}
-	if req.PluginID != "" {
-		var manifest *plugin.Manifest
-		for _, item := range h.plugins.List() {
-			if item.Manifest.ID == req.PluginID {
-				manifest = &item.Manifest
-				break
-			}
-		}
-		if manifest != nil && len(req.Models) > 0 {
-			allowed := map[string]bool{}
-			for _, m := range manifest.Models {
-				allowed[m.ID] = true
-			}
-			for _, modelID := range req.Models {
-				if !allowed[modelID] {
-					writeError(w, http.StatusBadRequest, fmt.Errorf("model %q not declared by plugin %q", modelID, req.PluginID))
-					return
-				}
-			}
-		}
-		if manifest != nil && len(req.Models) == 0 && len(manifest.Models) > 0 {
-			req.Models = make([]string, 0, len(manifest.Models))
-			for _, model := range manifest.Models {
-				req.Models = append(req.Models, model.ID)
-			}
-		}
-	}
-	if req.CreatedAt.IsZero() {
-		req.CreatedAt = time.Now().UTC()
-	}
-	req.UpdatedAt = time.Now().UTC()
-	if err := h.sources.Upsert(req); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, req)
-}
-
-func (h *Handler) validateSource(w http.ResponseWriter, r *http.Request) {
-	sourceID := chi.URLParam(r, "sourceID")
-	if strings.TrimSpace(sourceID) == "" {
-		writeError(w, http.StatusBadRequest, errors.New("sourceID is required"))
-		return
-	}
-	src, err := findSourceByID(h.sources.List(), sourceID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	var req struct {
-		Model   string `json:"model"`
-		Message string `json:"message"`
-	}
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
-	}
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		if len(src.Models) == 0 {
-			writeError(w, http.StatusBadRequest, errors.New("source has no enabled models"))
-			return
-		}
-		model = src.Models[0]
-	}
-	message := strings.TrimSpace(req.Message)
-	if message == "" {
-		message = strings.TrimSpace(src.ValidationMessage)
-	}
-	if message == "" {
-		message = "你好，请回复ok"
-	}
-	chatReq := chatCompletionRequest{Model: model, Stream: false, Thinking: false, Messages: []chatMessage{{Role: "user", Content: message}}, Metadata: map[string]string{"debug_validate": "1"}}
-	_, selection, result, execErr := h.executeChatPipeline(r, chatReq, nil)
-	if execErr != nil {
-		msg := execErr.Error()
-		if strings.Contains(msg, "upstream status 403") {
-			msg = msg + " (请检查该来源账号的 access_token/cookie/user_agent 是否有效)"
-		}
-		writeError(w, http.StatusBadRequest, errors.New(msg))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                 true,
-		"source_id":          sourceID,
-		"model":              model,
-		"account_id":         selection.Account.ID,
-		"preview":            buildValidationPreview(result),
-		"debug":              result.Raw,
-		"validation_message": message,
-	})
-}
-
 func buildValidationPreview(result plugin.ChatCompletionResult) string {
 	if strings.TrimSpace(result.Content) != "" {
 		return truncatePreview(result.Content, 220)
@@ -615,19 +475,6 @@ func truncatePreview(text string, max int) string {
 		return text
 	}
 	return text[:max] + "..."
-}
-
-func (h *Handler) deleteSource(w http.ResponseWriter, r *http.Request) {
-	sourceID := chi.URLParam(r, "sourceID")
-	if strings.TrimSpace(sourceID) == "" {
-		writeError(w, http.StatusBadRequest, errors.New("sourceID is required"))
-		return
-	}
-	if err := h.sources.Delete(sourceID); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
@@ -683,21 +530,34 @@ func buildModelObject(item catalogModel) map[string]any {
 		"owned_by":   "web2api",
 		"permission": []any{},
 		"web2api": map[string]any{
-			"name":         item.Name,
-			"plugin_id":    item.PluginID,
-			"source_ids":   item.SourceIDs,
-			"modes":        item.Modes,
-			"source_model": item.SourceModel,
+			"name":          item.Name,
+			"plugin_id":     item.PluginID,
+			"plugin_source": sourceIDForPlugin(item.PluginID),
+			"modes":         item.Modes,
+			"plugin_model":  item.SourceModel,
 		},
 	}
 }
 
 type chatCompletionRequest struct {
-	Model    string            `json:"model"`
-	Messages []chatMessage     `json:"messages"`
-	Stream   bool              `json:"stream"`
-	Thinking bool              `json:"thinking"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Model      string            `json:"model"`
+	Messages   []chatMessage     `json:"messages"`
+	Stream     bool              `json:"stream"`
+	Thinking   bool              `json:"thinking"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	Tools      []chatTool        `json:"tools,omitempty"`
+	ToolChoice any               `json:"tool_choice,omitempty"`
+}
+
+type chatTool struct {
+	Type     string           `json:"type"`
+	Function chatToolFunction `json:"function"`
+}
+
+type chatToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 type chatMessage struct {
@@ -732,20 +592,122 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, authErr)
 		return
 	}
+	effectiveReq := req
+	if len(req.Tools) > 0 {
+		instruction := buildToolSystemInstruction(req.Tools, req.ToolChoice)
+		if strings.TrimSpace(instruction) != "" {
+			effectiveReq.Messages = append([]chatMessage{{Role: "system", Content: instruction}}, req.Messages...)
+		}
+	}
+	if effectiveReq.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+			return
+		}
 
-	src, selection, result, err := h.executeChatPipeline(r, req, consumerCfg)
+		streamedContent := ""
+		streamedThinking := ""
+		hasChunk := false
+		src, selection, result, err := h.executeChatPipelineStream(r, effectiveReq, consumerCfg, func(chunk plugin.ChatCompletionChunk) error {
+			hasChunk = true
+			if chunk.Thinking != "" {
+				streamedThinking += chunk.Thinking
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning":%q}}]}`, chunk.Thinking))
+				flusher.Flush()
+			}
+			if chunk.Content != "" {
+				streamedContent += chunk.Content
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, chunk.Content))
+				flusher.Flush()
+			}
+			return nil
+		})
+		if err != nil {
+			if len(req.Tools) > 0 {
+				h.appendToolCallLog(r, effectiveReq, "", nil, plugin.ChatCompletionResult{}, err)
+			}
+			if !hasChunk {
+				writeError(w, http.StatusBadRequest, err)
+			} else {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, "[stream error] "+err.Error()))
+				_, _ = fmt.Fprint(w, "data: {\"id\":\"done\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				flusher.Flush()
+			}
+			return
+		}
+		_ = src
+		_ = selection
+		toolCalls := extractToolCalls(result.Raw)
+		if len(req.Tools) > 0 {
+			finishLog := "stop"
+			if len(toolCalls) > 0 {
+				finishLog = "tool_calls"
+			}
+			h.appendToolCallLog(r, effectiveReq, finishLog, toolCalls, result, nil)
+		}
+		if len(req.Tools) > 0 && isToolCallRequired(req.ToolChoice) && len(toolCalls) == 0 {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, "[tool error] model did not return required tool_calls"))
+			_, _ = fmt.Fprint(w, "data: {\"id\":\"done\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		if !hasChunk {
+			if len(toolCalls) > 0 {
+				streamChatCompletionToolCalls(w, effectiveReq.Model, toolCalls)
+				return
+			}
+			streamChatCompletion(w, effectiveReq.Model, result.Content, result.Thinking)
+			return
+		}
+
+		if strings.HasPrefix(result.Thinking, streamedThinking) {
+			tail := strings.TrimPrefix(result.Thinking, streamedThinking)
+			if tail != "" {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning":%q}}]}`, tail))
+				flusher.Flush()
+			}
+		}
+		if strings.HasPrefix(result.Content, streamedContent) {
+			tail := strings.TrimPrefix(result.Content, streamedContent)
+			if tail != "" {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, tail))
+				flusher.Flush()
+			}
+		}
+		finish := "stop"
+		if len(toolCalls) > 0 && strings.TrimSpace(result.Content) == "" {
+			finish = "tool_calls"
+		}
+		_, _ = fmt.Fprintf(w, "data: {\"id\":\"done\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":%q}]}\n\n", finish)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	src, selection, result, err := h.executeChatPipeline(r, effectiveReq, consumerCfg)
 	if err != nil {
+		if len(req.Tools) > 0 {
+			h.appendToolCallLog(r, effectiveReq, "", nil, plugin.ChatCompletionResult{}, err)
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	toolCalls := extractToolCalls(result.Raw)
-
-	if req.Stream {
+	if len(req.Tools) > 0 {
+		finishLog := "stop"
 		if len(toolCalls) > 0 {
-			streamChatCompletionToolCalls(w, req.Model, toolCalls)
-			return
+			finishLog = "tool_calls"
 		}
-		streamChatCompletion(w, req.Model, result.Content, result.Thinking)
+		h.appendToolCallLog(r, effectiveReq, finishLog, toolCalls, result, nil)
+	}
+	if len(req.Tools) > 0 && isToolCallRequired(req.ToolChoice) && len(toolCalls) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("model did not return required tool_calls"))
 		return
 	}
 	finishReason := "stop"
@@ -760,7 +722,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   req.Model,
+		"model":   effectiveReq.Model,
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       message,
@@ -768,8 +730,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}},
 		"usage": result.Usage,
 		"web2api": map[string]any{
-			"source_id":  src.ID,
-			"thinking":   req.Thinking,
+			"thinking":   effectiveReq.Thinking,
 			"plugin_id":  src.PluginID,
 			"account_id": selection.Account.ID,
 			"mode":       "plugin",
@@ -800,13 +761,58 @@ func (h *Handler) completions(w http.ResponseWriter, r *http.Request) {
 		Metadata: req.Metadata,
 		Messages: []chatMessage{{Role: "user", Content: prompt}},
 	}
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+			return
+		}
+
+		streamedText := ""
+		hasChunk := false
+		_, _, result, err := h.executeChatPipelineStream(r, chatReq, consumerCfg, func(chunk plugin.ChatCompletionChunk) error {
+			hasChunk = true
+			if chunk.Content != "" {
+				streamedText += chunk.Content
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"cmpl-chunk","object":"text_completion","model":%q,"choices":[{"text":%q,"index":0,"finish_reason":null}]}`, req.Model, chunk.Content))
+				flusher.Flush()
+			}
+			return nil
+		})
+		if err != nil {
+			if !hasChunk {
+				writeError(w, http.StatusBadRequest, err)
+			} else {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"cmpl-chunk","object":"text_completion","model":%q,"choices":[{"text":%q,"index":0,"finish_reason":null}]}`, req.Model, "[stream error] "+err.Error()))
+				_, _ = fmt.Fprint(w, "data: {\"id\":\"cmpl-done\",\"object\":\"text_completion\",\"choices\":[{\"text\":\"\",\"index\":0,\"finish_reason\":\"stop\"}]}\n\n")
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				flusher.Flush()
+			}
+			return
+		}
+		if !hasChunk {
+			streamCompletions(w, req.Model, result.Content)
+			return
+		}
+		if strings.HasPrefix(result.Content, streamedText) {
+			tail := strings.TrimPrefix(result.Content, streamedText)
+			if tail != "" {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"cmpl-chunk","object":"text_completion","model":%q,"choices":[{"text":%q,"index":0,"finish_reason":null}]}`, req.Model, tail))
+				flusher.Flush()
+			}
+		}
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"cmpl-done\",\"object\":\"text_completion\",\"choices\":[{\"text\":\"\",\"index\":0,\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
 	src, selection, result, err := h.executeChatPipeline(r, chatReq, consumerCfg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if req.Stream {
-		streamCompletions(w, req.Model, result.Content)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -816,7 +822,7 @@ func (h *Handler) completions(w http.ResponseWriter, r *http.Request) {
 		"model":   req.Model,
 		"choices": []map[string]any{{"text": result.Content, "index": 0, "finish_reason": "stop"}},
 		"usage":   result.Usage,
-		"web2api": map[string]any{"source_id": src.ID, "plugin_id": src.PluginID, "account_id": selection.Account.ID, "mode": "plugin"},
+		"web2api": map[string]any{"plugin_id": src.PluginID, "account_id": selection.Account.ID, "mode": "plugin"},
 	})
 }
 
@@ -846,14 +852,71 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		Metadata: req.Metadata,
 	}
 
-	src, selection, result, err := h.executeChatPipeline(r, chatReq, consumerCfg)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+			return
+		}
+
+		streamedText := ""
+		streamedThinking := ""
+		hasChunk := false
+		_, _, result, err := h.executeChatPipelineStream(r, chatReq, consumerCfg, func(chunk plugin.ChatCompletionChunk) error {
+			hasChunk = true
+			if chunk.Thinking != "" {
+				streamedThinking += chunk.Thinking
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.reasoning.delta","model":%q,"delta":%q}`, req.Model, chunk.Thinking))
+				flusher.Flush()
+			}
+			if chunk.Content != "" {
+				streamedText += chunk.Content
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.output_text.delta","model":%q,"delta":%q}`, req.Model, chunk.Content))
+				flusher.Flush()
+			}
+			return nil
+		})
+		if err != nil {
+			if !hasChunk {
+				writeError(w, http.StatusBadRequest, err)
+			} else {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.output_text.delta","model":%q,"delta":%q}`, req.Model, "[stream error] "+err.Error()))
+				_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\"}\n\n")
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				flusher.Flush()
+			}
+			return
+		}
+		if !hasChunk {
+			streamResponses(w, req.Model, result.Content, result.Thinking)
+			return
+		}
+		if strings.HasPrefix(result.Thinking, streamedThinking) {
+			tail := strings.TrimPrefix(result.Thinking, streamedThinking)
+			if tail != "" {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.reasoning.delta","model":%q,"delta":%q}`, req.Model, tail))
+				flusher.Flush()
+			}
+		}
+		if strings.HasPrefix(result.Content, streamedText) {
+			tail := strings.TrimPrefix(result.Content, streamedText)
+			if tail != "" {
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.output_text.delta","model":%q,"delta":%q}`, req.Model, tail))
+				flusher.Flush()
+			}
+		}
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\"}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
 		return
 	}
 
-	if req.Stream {
-		streamResponses(w, req.Model, result.Content, result.Thinking)
+	src, selection, result, err := h.executeChatPipeline(r, chatReq, consumerCfg)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	toolCalls := extractToolCalls(result.Raw)
@@ -892,7 +955,6 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		"output_text": result.Content,
 		"usage":       result.Usage,
 		"web2api": map[string]any{
-			"source_id":  src.ID,
 			"thinking":   req.Thinking,
 			"plugin_id":  src.PluginID,
 			"account_id": selection.Account.ID,
@@ -902,7 +964,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) executeChatPipeline(r *http.Request, req chatCompletionRequest, consumerCfg *consumer.Config) (source.Config, account.Selection, plugin.ChatCompletionResult, error) {
-	src, err := h.sources.FindByModel(req.Model)
+	src, err := h.resolveSourceForModel(req.Model)
 	if err != nil {
 		return source.Config{}, account.Selection{}, plugin.ChatCompletionResult{}, err
 	}
@@ -914,18 +976,12 @@ func (h *Handler) executeChatPipeline(r *http.Request, req chatCompletionRequest
 	pluginReq := req
 
 	now := time.Now().UTC()
-	selection, err := h.accounts.Select(src.ID, now)
+	selection, err := h.accounts.SelectByPluginModel(src.PluginID, req.Model, now)
 	if err != nil {
-		if strings.TrimSpace(src.PluginID) != "" {
-			fallback, fallbackErr := h.accounts.SelectByPlugin(src.PluginID, now)
-			if fallbackErr == nil {
-				selection = fallback
-				err = nil
-			}
-		}
+		selection, err = h.accounts.SelectByPlugin(src.PluginID, now)
 	}
 	if err != nil {
-		return src, account.Selection{}, plugin.ChatCompletionResult{}, fmt.Errorf("no available account for source %q", src.ID)
+		return src, account.Selection{}, plugin.ChatCompletionResult{}, fmt.Errorf("no available account for plugin %q model %q", src.PluginID, req.Model)
 	}
 	if missing := missingRequiredFields(selection.Account.Fields, requiredFields); len(missing) > 0 {
 		return src, selection, plugin.ChatCompletionResult{}, fmt.Errorf("selected account %q missing required field(s): %s", selection.Account.ID, strings.Join(missing, ","))
@@ -933,11 +989,58 @@ func (h *Handler) executeChatPipeline(r *http.Request, req chatCompletionRequest
 	if pluginReq.Metadata == nil {
 		pluginReq.Metadata = map[string]string{}
 	}
+	if rid := strings.TrimSpace(middleware.GetReqID(r.Context())); rid != "" {
+		pluginReq.Metadata["request_trace_id"] = rid
+	}
 	pluginReq.Metadata["account_id"] = selection.Account.ID
 
 	result, err := h.runChatPlugin(r, src, pluginReq, selection.Account)
 	if err != nil {
-		if selection.Account.ID != "" {
+		if selection.Account.ID != "" && shouldMarkAccountFailure(err) {
+			_ = h.accounts.MarkFailure(selection.Account.ID, err.Error(), 5*time.Minute, time.Now().UTC())
+		}
+		return src, selection, plugin.ChatCompletionResult{}, err
+	}
+	if selection.Account.ID != "" {
+		_ = h.accounts.MarkSuccess(selection.Account.ID, time.Now().UTC())
+	}
+	return src, selection, result, nil
+}
+
+func (h *Handler) executeChatPipelineStream(r *http.Request, req chatCompletionRequest, consumerCfg *consumer.Config, onChunk func(plugin.ChatCompletionChunk) error) (source.Config, account.Selection, plugin.ChatCompletionResult, error) {
+	src, err := h.resolveSourceForModel(req.Model)
+	if err != nil {
+		return source.Config{}, account.Selection{}, plugin.ChatCompletionResult{}, err
+	}
+	if !isModelAllowedForConsumer(consumerCfg, req.Model) {
+		return source.Config{}, account.Selection{}, plugin.ChatCompletionResult{}, fmt.Errorf("model %q not allowed for this client", req.Model)
+	}
+	requiredFields := h.requiredAccountFields(src.PluginID)
+
+	pluginReq := req
+
+	now := time.Now().UTC()
+	selection, err := h.accounts.SelectByPluginModel(src.PluginID, req.Model, now)
+	if err != nil {
+		selection, err = h.accounts.SelectByPlugin(src.PluginID, now)
+	}
+	if err != nil {
+		return src, account.Selection{}, plugin.ChatCompletionResult{}, fmt.Errorf("no available account for plugin %q model %q", src.PluginID, req.Model)
+	}
+	if missing := missingRequiredFields(selection.Account.Fields, requiredFields); len(missing) > 0 {
+		return src, selection, plugin.ChatCompletionResult{}, fmt.Errorf("selected account %q missing required field(s): %s", selection.Account.ID, strings.Join(missing, ","))
+	}
+	if pluginReq.Metadata == nil {
+		pluginReq.Metadata = map[string]string{}
+	}
+	if rid := strings.TrimSpace(middleware.GetReqID(r.Context())); rid != "" {
+		pluginReq.Metadata["request_trace_id"] = rid
+	}
+	pluginReq.Metadata["account_id"] = selection.Account.ID
+
+	result, err := h.runChatPluginStream(r, src, pluginReq, selection.Account, onChunk)
+	if err != nil {
+		if selection.Account.ID != "" && shouldMarkAccountFailure(err) {
 			_ = h.accounts.MarkFailure(selection.Account.ID, err.Error(), 5*time.Minute, time.Now().UTC())
 		}
 		return src, selection, plugin.ChatCompletionResult{}, err
@@ -975,6 +1078,196 @@ func missingRequiredFields(values map[string]string, required []string) []string
 		}
 	}
 	return missing
+}
+
+func buildToolSystemInstruction(tools []chatTool, toolChoice any) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	compact := compactToolsForPrompt(tools)
+	b, _ := json.Marshal(compact)
+	choice := toolChoiceString(toolChoice)
+	if strings.TrimSpace(choice) == "" {
+		choice = "auto"
+	}
+	return "[Tool Calling Contract]\nYou MUST only use tools listed in available_tools; never invent tool names.\nIf tool is NOT needed, answer normally in plain text.\nIf tool IS needed, output ONLY XML and nothing else: <tool_calls><tool_call><tool_name>NAME</tool_name><parameters>{JSON}</parameters></tool_call></tool_calls>.\nDo not claim tool execution in natural language.\nFor tool_choice=required you must return tool XML; for tool_choice=auto choose based on necessity.\ntool_choice=" + choice + "\navailable_tools=" + string(b)
+}
+
+func compactToolsForPrompt(tools []chatTool) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		name := strings.TrimSpace(t.Function.Name)
+		if name == "" {
+			continue
+		}
+		entry := map[string]any{"name": name}
+		desc := strings.TrimSpace(t.Function.Description)
+		if desc != "" {
+			entry["description"] = truncatePreview(desc, 180)
+		}
+		if params := compactToolParameters(t.Function.Parameters); len(params) > 0 {
+			entry["parameters"] = params
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func compactToolParameters(schema map[string]any) map[string]any {
+	if len(schema) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	if typ, ok := schema["type"].(string); ok && strings.TrimSpace(typ) != "" {
+		out["type"] = strings.TrimSpace(typ)
+	}
+	if req, ok := schema["required"].([]any); ok && len(req) > 0 {
+		names := make([]string, 0, len(req))
+		for _, item := range req {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				names = append(names, s)
+			}
+		}
+		if len(names) > 0 {
+			out["required"] = names
+		}
+	}
+	if props, ok := schema["properties"].(map[string]any); ok && len(props) > 0 {
+		fields := make([]map[string]any, 0, len(props))
+		for k, raw := range props {
+			item := map[string]any{"name": k}
+			if p, ok := raw.(map[string]any); ok {
+				if t, ok := p["type"].(string); ok && strings.TrimSpace(t) != "" {
+					item["type"] = strings.TrimSpace(t)
+				}
+				if d, ok := p["description"].(string); ok && strings.TrimSpace(d) != "" {
+					item["description"] = truncatePreview(d, 120)
+				}
+			}
+			fields = append(fields, item)
+		}
+		sort.Slice(fields, func(i, j int) bool {
+			return fmt.Sprint(fields[i]["name"]) < fmt.Sprint(fields[j]["name"])
+		})
+		out["fields"] = fields
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (h *Handler) appendToolCallLog(r *http.Request, req chatCompletionRequest, finish string, calls []toolCall, result plugin.ChatCompletionResult, err error) {
+	entry := toolCallLogEntry{
+		At:         time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		RequestID:  strings.TrimSpace(middleware.GetReqID(r.Context())),
+		Model:      req.Model,
+		Stream:     req.Stream,
+		ToolChoice: toolChoiceString(req.ToolChoice),
+		ToolCount:  len(req.Tools),
+		Finish:     finish,
+		ToolCalls:  len(calls),
+	}
+	if b, marshalErr := json.Marshal(req); marshalErr == nil {
+		entry.Request = string(b)
+	}
+	if err != nil {
+		entry.Error = err.Error()
+	}
+	if text := strings.TrimSpace(result.Content); text != "" {
+		entry.Content = text
+	}
+	if result.Raw != nil {
+		if b, marshalErr := json.Marshal(result.Raw); marshalErr == nil {
+			entry.Raw = string(b)
+		}
+	}
+
+	h.toolLogMu.Lock()
+	h.toolLogs = append([]toolCallLogEntry{entry}, h.toolLogs...)
+	if len(h.toolLogs) > 200 {
+		h.toolLogs = h.toolLogs[:200]
+	}
+	h.toolLogMu.Unlock()
+
+	log.Printf("tool-call trace=%s model=%s stream=%v choice=%s tools=%d finish=%s calls=%d request=%q err=%s content=%q raw=%q",
+		entry.RequestID, entry.Model, entry.Stream, entry.ToolChoice, entry.ToolCount, entry.Finish, entry.ToolCalls, entry.Request, entry.Error, entry.Content, entry.Raw)
+}
+
+func toolChoiceString(choice any) string {
+	if choice == nil {
+		return ""
+	}
+	switch v := choice.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+}
+
+func isToolCallRequired(choice any) bool {
+	if choice == nil {
+		return false
+	}
+	switch v := choice.(type) {
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s == "required"
+	case map[string]any:
+		if t, ok := v["type"].(string); ok && strings.EqualFold(strings.TrimSpace(t), "function") {
+			return true
+		}
+		if fn, ok := v["function"].(map[string]any); ok {
+			if _, ok := fn["name"].(string); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shouldMarkAccountFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	internalSignals := []string{
+		"plugin exceeded max steps",
+		"plugin step timeout",
+		"decode plugin output",
+		"unsupported output type",
+		"empty stdout",
+		"stream error",
+	}
+	for _, s := range internalSignals {
+		if strings.Contains(msg, s) {
+			return false
+		}
+	}
+	upstreamSignals := []string{
+		"upstream status",
+		"forbidden",
+		"rate limit",
+		"too many requests",
+		"invalid credentials",
+		"check access_token",
+		"cookie",
+		"user_agent",
+	}
+	for _, s := range upstreamSignals {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) authenticateConsumer(r *http.Request) (*consumer.Config, error) {
@@ -1015,61 +1308,63 @@ func isModelAllowedForConsumer(cfg *consumer.Config, modelID string) bool {
 	return false
 }
 
-func findSourceByID(items []source.Config, id string) (source.Config, error) {
-	for _, item := range items {
-		if item.ID == id {
-			return item, nil
-		}
-	}
-	return source.Config{}, fmt.Errorf("source %q not found", id)
-}
-
 type catalogModel struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name,omitempty"`
 	PluginID    string   `json:"plugin_id"`
-	SourceIDs   []string `json:"source_ids,omitempty"`
 	SourceModel string   `json:"source_model"`
 	Modes       []string `json:"modes,omitempty"`
 }
 
 func (h *Handler) collectCatalogModels() []catalogModel {
 	registry := map[string]catalogModel{}
-	for _, src := range h.sources.List() {
-		if !strings.HasPrefix(src.ID, "plugin:") {
+	for _, desc := range h.plugins.List() {
+		if desc.Status != "ready" || strings.TrimSpace(desc.Manifest.ID) == "" {
 			continue
-		}
-		if !src.Enabled || src.PluginID == "" {
-			continue
-		}
-		desc, ok := h.plugins.Get(src.PluginID)
-		if !ok || desc.Status != "ready" {
-			continue
-		}
-		selected := map[string]bool{}
-		for _, modelID := range src.Models {
-			selected[modelID] = true
 		}
 		for _, model := range desc.Manifest.Models {
-			if len(selected) > 0 && !selected[model.ID] {
+			if strings.TrimSpace(model.ID) == "" {
 				continue
 			}
 			item, exists := registry[model.ID]
 			if !exists {
-				item = catalogModel{ID: model.ID, Name: model.Name, PluginID: src.PluginID, SourceModel: model.ID, Modes: model.Modes, SourceIDs: []string{src.ID}}
-			} else {
-				item.SourceIDs = append(item.SourceIDs, src.ID)
+				item = catalogModel{ID: model.ID, Name: model.Name, PluginID: desc.Manifest.ID, SourceModel: model.ID, Modes: model.Modes}
 			}
 			registry[model.ID] = item
 		}
 	}
 	out := make([]catalogModel, 0, len(registry))
 	for _, item := range registry {
-		sort.Strings(item.SourceIDs)
 		out = append(out, item)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+func (h *Handler) resolveSourceForModel(modelID string) (source.Config, error) {
+	for _, item := range h.collectCatalogModels() {
+		if item.ID != modelID {
+			continue
+		}
+		srcID := sourceIDForPlugin(item.PluginID)
+		return source.Config{
+			ID:       srcID,
+			Name:     item.PluginID,
+			PluginID: item.PluginID,
+			Enabled:  true,
+			Models:   []string{item.ID},
+		}, nil
+	}
+	return source.Config{}, fmt.Errorf("no enabled plugin model matched %q", modelID)
+}
+
+func (h *Handler) resolveSourceForPlugin(pluginID string) (source.Config, error) {
+	pluginID = strings.TrimSpace(pluginID)
+	if pluginID == "" {
+		return source.Config{}, errors.New("plugin_id is required")
+	}
+	srcID := sourceIDForPlugin(pluginID)
+	return source.Config{ID: srcID, Name: pluginID, PluginID: pluginID, Enabled: true}, nil
 }
 
 func parseResponsesInput(raw json.RawMessage) ([]chatMessage, error) {
@@ -1175,7 +1470,16 @@ func (h *Handler) runChatPlugin(r *http.Request, src source.Config, req chatComp
 		Stream:   req.Stream,
 		Thinking: req.Thinking,
 		Metadata: req.Metadata,
+		Tools:    make([]plugin.Tool, 0, len(req.Tools)),
 		Messages: make([]plugin.ChatMessage, 0, len(req.Messages)),
+	}
+	if req.ToolChoice != nil {
+		if b, err := json.Marshal(req.ToolChoice); err == nil {
+			pluginReq.ToolChoice = b
+		}
+	}
+	for _, t := range req.Tools {
+		pluginReq.Tools = append(pluginReq.Tools, plugin.Tool{Type: t.Type, Function: plugin.ToolFunction{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters}})
 	}
 	for _, msg := range req.Messages {
 		content := parseResponseContent(msg.Content)
@@ -1186,6 +1490,38 @@ func (h *Handler) runChatPlugin(r *http.Request, src source.Config, req chatComp
 	}
 
 	return h.plugins.ExecuteChatCompletion(r.Context(), src.PluginID, pluginReq, src, accountCfg.ID, accountCfg.Name, accountCfg.Fields)
+}
+
+func (h *Handler) runChatPluginStream(r *http.Request, src source.Config, req chatCompletionRequest, accountCfg account.Config, onChunk func(plugin.ChatCompletionChunk) error) (plugin.ChatCompletionResult, error) {
+	if src.PluginID == "" {
+		return fallbackChatResult(src, req), nil
+	}
+
+	pluginReq := plugin.ChatCompletionRequest{
+		Model:    req.Model,
+		Stream:   req.Stream,
+		Thinking: req.Thinking,
+		Metadata: req.Metadata,
+		Tools:    make([]plugin.Tool, 0, len(req.Tools)),
+		Messages: make([]plugin.ChatMessage, 0, len(req.Messages)),
+	}
+	if req.ToolChoice != nil {
+		if b, err := json.Marshal(req.ToolChoice); err == nil {
+			pluginReq.ToolChoice = b
+		}
+	}
+	for _, t := range req.Tools {
+		pluginReq.Tools = append(pluginReq.Tools, plugin.Tool{Type: t.Type, Function: plugin.ToolFunction{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters}})
+	}
+	for _, msg := range req.Messages {
+		content := parseResponseContent(msg.Content)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		pluginReq.Messages = append(pluginReq.Messages, plugin.ChatMessage{Role: msg.Role, Content: content})
+	}
+
+	return h.plugins.ExecuteChatCompletionStream(r.Context(), src.PluginID, pluginReq, src, accountCfg.ID, accountCfg.Name, accountCfg.Fields, onChunk)
 }
 
 func fallbackChatResult(src source.Config, req chatCompletionRequest) plugin.ChatCompletionResult {
@@ -1231,8 +1567,8 @@ func streamChatCompletion(w http.ResponseWriter, model string, answer string, th
 	if thinking != "" {
 		chunks = append(chunks, fmt.Sprintf(`{"id":"thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning":%q}}]}`, thinking))
 	}
-	for _, token := range strings.Fields(answer) {
-		chunks = append(chunks, fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, model, token+" "))
+	for _, token := range splitTextForStream(answer, 24) {
+		chunks = append(chunks, fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, model, token))
 	}
 	chunks = append(chunks, `{"id":"done","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
 
@@ -1356,6 +1692,25 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
+func splitTextForStream(text string, maxRunes int) []string {
+	if text == "" {
+		return nil
+	}
+	if maxRunes <= 0 {
+		maxRunes = 24
+	}
+	runes := []rune(text)
+	out := make([]string, 0, (len(runes)+maxRunes-1)/maxRunes)
+	for i := 0; i < len(runes); i += maxRunes {
+		end := i + maxRunes
+		if end > len(runes) {
+			end = len(runes)
+		}
+		out = append(out, string(runes[i:end]))
+	}
+	return out
+}
+
 func streamResponses(w http.ResponseWriter, model string, answer string, thinking string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1371,8 +1726,8 @@ func streamResponses(w http.ResponseWriter, model string, answer string, thinkin
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.reasoning.delta","model":%q,"delta":%q}`, model, thinking))
 		flusher.Flush()
 	}
-	for _, token := range strings.Fields(answer) {
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.output_text.delta","model":%q,"delta":%q}`, model, token+" "))
+	for _, token := range splitTextForStream(answer, 24) {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"response.output_text.delta","model":%q,"delta":%q}`, model, token))
 		flusher.Flush()
 	}
 	_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\"}\n\n")
@@ -1390,8 +1745,8 @@ func streamCompletions(w http.ResponseWriter, model string, answer string) {
 		writeError(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
 		return
 	}
-	for _, token := range strings.Fields(answer) {
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"cmpl-chunk","object":"text_completion","model":%q,"choices":[{"text":%q,"index":0,"finish_reason":null}]}`, model, token+" "))
+	for _, token := range splitTextForStream(answer, 24) {
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"cmpl-chunk","object":"text_completion","model":%q,"choices":[{"text":%q,"index":0,"finish_reason":null}]}`, model, token))
 		flusher.Flush()
 	}
 	_, _ = fmt.Fprint(w, "data: {\"id\":\"cmpl-done\",\"object\":\"text_completion\",\"choices\":[{\"text\":\"\",\"index\":0,\"finish_reason\":\"stop\"}]}\n\n")

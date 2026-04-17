@@ -109,7 +109,7 @@ func (s *Store) Select(sourceID string, now time.Time) (Selection, error) {
 	defer s.mu.RUnlock()
 	best := selectBest(s.items, func(item Config) bool { return item.SourceID == sourceID }, now)
 	if best == nil {
-		return Selection{}, fmt.Errorf("no available account for source %q", sourceID)
+		return Selection{}, fmt.Errorf("no available account for route %q", sourceID)
 	}
 	return Selection{Account: *best, Reason: "selected available account"}, nil
 }
@@ -122,6 +122,29 @@ func (s *Store) SelectByPlugin(pluginID string, now time.Time) (Selection, error
 		return Selection{}, fmt.Errorf("no available account for plugin %q", pluginID)
 	}
 	return Selection{Account: *best, Reason: "selected available plugin account"}, nil
+}
+
+func (s *Store) SelectByPluginModel(pluginID string, model string, now time.Time) (Selection, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best := selectBest(s.items, func(item Config) bool {
+		if item.PluginID != pluginID {
+			return false
+		}
+		if len(item.Models) == 0 {
+			return true
+		}
+		for _, enabled := range item.Models {
+			if enabled == model {
+				return true
+			}
+		}
+		return false
+	}, now)
+	if best == nil {
+		return Selection{}, fmt.Errorf("no available account for plugin %q and model %q", pluginID, model)
+	}
+	return Selection{Account: *best, Reason: "selected available plugin account by model"}, nil
 }
 
 func selectBest(items []Config, filter func(Config) bool, now time.Time) *Config {

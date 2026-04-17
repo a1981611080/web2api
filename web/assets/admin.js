@@ -25,6 +25,8 @@
             <a href="/admin/clients" data-nav="clients">客户端</a>
             <a href="/admin/test" data-nav="test">测试</a>
             <a href="/admin/status" data-nav="status">运行状态</a>
+            <a href="/admin/runtime" data-nav="runtime">插件运行池</a>
+            <a href="/admin/tool-calls" data-nav="toolcalls">工具调用日志</a>
           </nav>
         </aside>
         <main class="content">
@@ -51,6 +53,82 @@
     return (prefixes || []).map((value) => `<span class="pill">${escapeHTML(value)}</span>`).join('');
   }
 
+  function markdownToHTML(md) {
+    const escaped = escapeHTML(md || '');
+    const codeBlocks = [];
+    let html = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
+      const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+      codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+      return token;
+    });
+    html = html
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\[(.+?)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+    const lines = html.split('\n');
+    const blocks = [];
+    let listOpen = false;
+    const closeList = () => {
+      if (listOpen) {
+        blocks.push('</ul>');
+        listOpen = false;
+      }
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) {
+        closeList();
+        continue;
+      }
+      if (/^__CODE_BLOCK_\d+__$/.test(line)) {
+        closeList();
+        blocks.push(line);
+        continue;
+      }
+
+      const h3 = line.match(/^###\s+(.+)$/);
+      if (h3) {
+        closeList();
+        blocks.push(`<h3>${h3[1]}</h3>`);
+        continue;
+      }
+      const h2 = line.match(/^##\s+(.+)$/);
+      if (h2) {
+        closeList();
+        blocks.push(`<h2>${h2[1]}</h2>`);
+        continue;
+      }
+      const h1 = line.match(/^#\s+(.+)$/);
+      if (h1) {
+        closeList();
+        blocks.push(`<h1>${h1[1]}</h1>`);
+        continue;
+      }
+
+      const li = line.match(/^[-*]\s+(.+)$/);
+      if (li) {
+        if (!listOpen) {
+          blocks.push('<ul>');
+          listOpen = true;
+        }
+        blocks.push(`<li>${li[1]}</li>`);
+        continue;
+      }
+
+      closeList();
+      blocks.push(`<p>${line}</p>`);
+    }
+    closeList();
+    html = blocks.join('');
+
+    codeBlocks.forEach((block, idx) => {
+      html = html.replace(`__CODE_BLOCK_${idx}__`, block);
+    });
+    return html;
+  }
+
   function pluginByID(items, id) {
     return (items || []).find((item) => item.manifest && item.manifest.id === id);
   }
@@ -61,7 +139,7 @@
       return '<div class="muted">当前插件没有声明模型。</div>';
     }
     return models.map((model) => `
-      <label><input type="checkbox" name="selected_models" value="${escapeHTML(model.id)}" ${selected.includes(model.id) ? 'checked' : ''}> ${escapeHTML(model.name || model.id)}</label>
+      <label class="checkbox-row"><input type="checkbox" name="selected_models" value="${escapeHTML(model.id)}" ${selected.includes(model.id) ? 'checked' : ''}><span>${escapeHTML(model.name || model.id)}</span></label>
     `).join('');
   }
 
@@ -70,8 +148,7 @@
     adminLayout('后台总览', '查看当前插件、账号和操作入口。', `
       <div class="grid">
         <section class="card"><div class="muted">已就绪插件</div><div class="stat">${status.plugins.items.filter((p) => p.status === 'ready').length}</div></section>
-        <section class="card"><div class="muted">内部源总数</div><div class="stat">${status.sources.total}</div></section>
-        <section class="card"><div class="muted">启用内部源</div><div class="stat">${status.sources.enabled}</div></section>
+        <section class="card"><div class="muted">账号总数</div><div class="stat">${status.accounts.total}</div></section>
         <section class="card"><div class="muted">可用账号</div><div class="stat">${status.accounts.active}</div></section>
         <section class="card"><div class="muted">客户端账号</div><div class="stat">${status.consumers.total}</div></section>
         <section class="card"><div class="muted">模型目录</div><div class="stat">${status.catalog_models.total}</div></section>
@@ -87,9 +164,9 @@
           </div>
         </section>
         <section class="card">
-          <h3>当前内部源</h3>
+          <h3>模型目录预览</h3>
           <div class="list">
-            ${status.sources.items.map((item) => `<div class="item"><h3>${escapeHTML(item.name)} <span class="pill">${item.enabled ? 'enabled' : 'disabled'}</span></h3><div class="muted">plugin: ${escapeHTML(item.plugin_id || '(none)')}</div><div>${sourceBadges(item.models || [])}</div></div>`).join('') || '<div class="muted">还没有内部源。</div>'}
+            ${(status.catalog_models.items || []).slice(0, 8).map((item) => `<div class="item"><h3>${escapeHTML(item.id)}</h3><div class="muted">plugin: ${escapeHTML(item.plugin_id || '-')} | plugin_model: ${escapeHTML(item.source_model || '-')}</div></div>`).join('') || '<div class="muted">还没有模型目录。</div>'}
           </div>
         </section>
       </div>
@@ -353,7 +430,7 @@
       permsBox.innerHTML = groupedModels.map((group) => `
         <div class="item" style="margin-bottom:10px;">
           <h3>${escapeHTML(group.pluginID)} <span class="pill">plugin</span></h3>
-          <div>${group.models.map((model) => `<label><input type="checkbox" name="client_model_perm" value="${escapeHTML(model.id)}" ${selected.includes(model.id) ? 'checked' : ''}> ${escapeHTML(model.id)}</label>`).join('')}</div>
+          <div>${group.models.map((model) => `<label class="checkbox-row"><input type="checkbox" name="client_model_perm" value="${escapeHTML(model.id)}" ${selected.includes(model.id) ? 'checked' : ''}><span>${escapeHTML(model.id)}</span></label>`).join('')}</div>
         </div>
       `).join('') || '<div class="muted">没有可用模型。</div>';
     };
@@ -411,17 +488,23 @@
           <label>客户端<select id="client-select"><option value="">无（仅无鉴权时可用）</option></select></label>
           <label>模型<select id="model-select"></select></label>
           <label>消息<textarea id="message" rows="7">你好，介绍一下你自己</textarea></label>
-          <label><input type="checkbox" id="stream" checked> 流式返回</label>
-          <label><input type="checkbox" id="thinking"> thinking 输出</label>
+          <label class="checkbox-row"><input type="checkbox" id="stream" checked><span>流式返回</span></label>
+          <label class="checkbox-row"><input type="checkbox" id="thinking"><span>thinking 输出</span></label>
           <div class="toolbar">
             <button id="send">发送测试请求</button>
             <a href="/webui/test"><button type="button" class="secondary">打开用户测试页</button></a>
           </div>
         </section>
-        <section class="card">
-          <h3>返回内容</h3>
-          <pre id="output"></pre>
-        </section>
+        <div style="display:grid; gap:16px;">
+          <section class="card">
+            <h3>返回内容（原始）</h3>
+            <pre id="output"></pre>
+          </section>
+          <section class="card">
+            <h3>返回内容（渲染）</h3>
+            <div id="rendered-output" style="line-height:1.6; min-height:140px;"></div>
+          </section>
+        </div>
       </div>
     `);
 
@@ -450,7 +533,9 @@
 
     document.getElementById('send').addEventListener('click', async () => {
       const output = document.getElementById('output');
+      const rendered = document.getElementById('rendered-output');
       output.textContent = '';
+      rendered.innerHTML = '';
       const payload = {
         model: modelSelect.value,
         stream: document.getElementById('stream').checked,
@@ -466,15 +551,42 @@
         body: JSON.stringify(payload)
       });
       if (!payload.stream) {
-        output.textContent = JSON.stringify(await res.json(), null, 2);
+        const data = await res.json();
+        output.textContent = JSON.stringify(data, null, 2);
+        const text = data && data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+        rendered.innerHTML = markdownToHTML(text || '(无文本返回)');
         return;
       }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let streamText = '';
+      let buffer = '';
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        output.textContent += decoder.decode(value, { stream: true });
+        const chunkText = decoder.decode(value, { stream: true });
+        output.textContent += chunkText;
+        buffer += chunkText;
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          let obj = null;
+          try { obj = JSON.parse(data); } catch (_) { obj = null; }
+          if (!obj) continue;
+          const choices = obj.choices || [];
+          const delta = choices[0] && choices[0].delta ? choices[0].delta : {};
+          if (typeof delta.content === 'string' && delta.content) {
+            streamText += delta.content;
+            rendered.innerHTML = markdownToHTML(streamText);
+          }
+        }
+      }
+      if (!streamText.trim()) {
+        rendered.innerHTML = markdownToHTML('(流式结束，但没有文本片段)');
       }
     });
   }
@@ -492,17 +604,10 @@
         ${item.error ? `<div class="muted" style="margin-top:8px;color:#fecaca;">error: ${escapeHTML(item.error)}</div>` : ''}
       </div>
     `).join('') || '<div class="muted">无插件。</div>';
-    const sourceCards = (status.sources.items || []).map((item) => `
-      <div class="item">
-        <h3>${escapeHTML(item.name)} <span class="pill">${item.enabled ? 'enabled' : 'disabled'}</span></h3>
-        <div class="muted">id: ${escapeHTML(item.id)} | plugin: ${escapeHTML(item.plugin_id || '(none)')}</div>
-        <div style="margin-top:8px;">${sourceBadges(item.models || [])}</div>
-      </div>
-    `).join('') || '<div class="muted">无内部源。</div>';
     const accountCards = (status.accounts.items || []).map((item) => `
       <div class="item">
         <h3>${escapeHTML(item.name)} <span class="pill">${escapeHTML(item.status || 'active')}</span></h3>
-        <div class="muted">id: ${escapeHTML(item.id)} | source: ${escapeHTML(item.source_id)}</div>
+        <div class="muted">id: ${escapeHTML(item.id)} | plugin: ${escapeHTML(item.plugin_id || '-')}</div>
         <div class="muted">used/max: ${escapeHTML(item.used_requests || 0)} / ${escapeHTML(item.max_requests || 0)}</div>
       </div>
     `).join('') || '<div class="muted">无账号。</div>';
@@ -510,7 +615,7 @@
       <div class="item"><h3>${escapeHTML(item.name)} <span class="pill">${item.enabled ? 'enabled' : 'disabled'}</span></h3><div class="muted">id: ${escapeHTML(item.id)}</div></div>
     `).join('') || '<div class="muted">无客户端账号。</div>';
     const modelRouteCards = (status.catalog_models.items || []).map((item) => `
-      <div class="item"><h3>${escapeHTML(item.id)}</h3><div class="muted">plugin: ${escapeHTML(item.plugin_id)} | source_model: ${escapeHTML(item.source_model)}</div></div>
+      <div class="item"><h3>${escapeHTML(item.id)}</h3><div class="muted">plugin: ${escapeHTML(item.plugin_id)} | plugin_model: ${escapeHTML(item.source_model)}</div></div>
     `).join('') || '<div class="muted">无模型路由。</div>';
     adminLayout('运行状态', '查看当前加载结果和管理台入口。', `
       <div class="grid">
@@ -519,12 +624,78 @@
       </div>
       <div class="grid" style="margin-top:20px;">
         <section class="card"><h3>插件详情</h3><div class="list">${pluginCards}</div></section>
-        <section class="card"><h3>内部源详情</h3><div class="list">${sourceCards}</div></section>
         <section class="card"><h3>账号详情</h3><div class="list">${accountCards}</div></section>
         <section class="card"><h3>客户端详情</h3><div class="list">${consumerCards}</div></section>
         <section class="card"><h3>模型路由详情</h3><div class="list">${modelRouteCards}</div></section>
       </div>
     `);
+  }
+
+  async function renderRuntime() {
+    adminLayout('插件运行池', '查看常驻插件进程、引用计数和延迟释放时间。', `
+      <section class="card">
+        <div class="toolbar">
+          <button id="runtime-refresh">刷新</button>
+        </div>
+        <div id="runtime-meta" class="muted" style="margin:8px 0 12px;"></div>
+        <div id="runtime-list" class="list"></div>
+      </section>
+    `);
+
+    const meta = document.getElementById('runtime-meta');
+    const list = document.getElementById('runtime-list');
+    const draw = async () => {
+      const payload = await getJSON('/api/admin/runtime');
+      meta.textContent = `now=${payload.now || '-'} | total=${payload.total || 0}`;
+      const items = payload.items || [];
+      list.innerHTML = items.map((item) => `
+        <div class="item">
+          <h3>${escapeHTML(item.plugin_id || '(unknown)')} <span class="pill">pid ${escapeHTML(item.pid || 0)}</span></h3>
+          <div class="muted">path: ${escapeHTML(item.path || '-')}</div>
+          <div class="muted">refs: ${escapeHTML(item.refs || 0)} | closed: ${item.closed ? 'true' : 'false'} | idle_release_at: ${escapeHTML(item.idle_release_at || '-')}</div>
+          <div class="muted">last_trace_id: ${escapeHTML(item.last_trace_id || '-')} | last_action: ${escapeHTML(item.last_action || '-')} | last_step: ${escapeHTML(item.last_step || 0)} | last_type: ${escapeHTML(item.last_type || '-')}</div>
+          <div class="muted">last_duration_ms: ${escapeHTML(item.last_duration_ms || 0)} | total_calls: ${escapeHTML(item.total_calls || 0)} | last_invoke_at: ${escapeHTML(item.last_invoke_at || '-')}</div>
+          ${item.last_error ? `<div class="muted" style="margin-top:8px;color:#fecaca;">last_error: ${escapeHTML(item.last_error)}</div>` : ''}
+        </div>
+      `).join('') || '<div class="muted">当前没有常驻插件进程。</div>';
+    };
+
+    document.getElementById('runtime-refresh').addEventListener('click', draw);
+    await draw();
+  }
+
+  async function renderToolCalls() {
+    adminLayout('工具调用日志', '查看模型在 tools 模式下的原始返回和工具调用判定。', `
+      <section class="card">
+        <div class="toolbar">
+          <button id="toolcalls-refresh">刷新</button>
+        </div>
+        <div id="toolcalls-meta" class="muted" style="margin:8px 0 12px;"></div>
+        <div id="toolcalls-list" class="list"></div>
+      </section>
+    `);
+
+    const meta = document.getElementById('toolcalls-meta');
+    const list = document.getElementById('toolcalls-list');
+    const draw = async () => {
+      const payload = await getJSON('/api/admin/tool-calls');
+      const items = payload.items || [];
+      meta.textContent = `total=${payload.total || 0}`;
+      list.innerHTML = items.map((item) => `
+        <div class="item">
+          <h3>${escapeHTML(item.model || '-')} <span class="pill">${escapeHTML(item.finish_reason || '-')}</span></h3>
+          <div class="muted">at: ${escapeHTML(item.at || '-')} | request_id: ${escapeHTML(item.request_id || '-')}</div>
+          <div class="muted">stream: ${item.stream ? 'true' : 'false'} | tool_choice: ${escapeHTML(item.tool_choice || '-')} | tools: ${escapeHTML(item.tool_count || 0)} | tool_calls: ${escapeHTML(item.tool_calls || 0)}</div>
+          ${item.request_preview ? `<pre style="margin-top:8px;white-space:pre-wrap;">request: ${escapeHTML(item.request_preview)}</pre>` : ''}
+          ${item.error ? `<div class="muted" style="margin-top:8px;color:#fecaca;">error: ${escapeHTML(item.error)}</div>` : ''}
+          ${item.content_preview ? `<div class="muted" style="margin-top:8px;">content: ${escapeHTML(item.content_preview)}</div>` : ''}
+          ${item.raw_preview ? `<pre style="margin-top:8px;white-space:pre-wrap;">${escapeHTML(item.raw_preview)}</pre>` : ''}
+        </div>
+      `).join('') || '<div class="muted">暂无工具调用日志。</div>';
+    };
+
+    document.getElementById('toolcalls-refresh').addEventListener('click', draw);
+    await draw();
   }
 
   const routes = {
@@ -533,7 +704,9 @@
     accounts: renderAccounts,
     clients: renderClients,
     test: renderTest,
-    status: renderStatus
+    status: renderStatus,
+		runtime: renderRuntime,
+		toolcalls: renderToolCalls
   };
 
   const run = routes[page];

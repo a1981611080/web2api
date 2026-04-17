@@ -96,6 +96,13 @@ label {
   color: #cfd8ea;
 }
 
+label.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 input,
 textarea,
 select {
@@ -107,6 +114,14 @@ select {
   border: 1px solid #334766;
   background: #0a1222;
   color: #fff;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 button {

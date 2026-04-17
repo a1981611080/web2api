@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,10 +13,11 @@ import (
 )
 
 type invocation struct {
-	Action      string       `json:"action"`
-	Step        int          `json:"step"`
-	Input       *input       `json:"input,omitempty"`
-	HostResults []hostResult `json:"host_results,omitempty"`
+	Action      string          `json:"action"`
+	Step        int             `json:"step"`
+	Input       *input          `json:"input,omitempty"`
+	State       json.RawMessage `json:"state,omitempty"`
+	HostResults []hostResult    `json:"host_results,omitempty"`
 }
 
 type input struct {
@@ -25,10 +27,24 @@ type input struct {
 }
 
 type request struct {
-	Model    string            `json:"model"`
-	Thinking bool              `json:"thinking"`
-	Metadata map[string]string `json:"metadata"`
-	Messages []message         `json:"messages"`
+	Model      string            `json:"model"`
+	Stream     bool              `json:"stream"`
+	Thinking   bool              `json:"thinking"`
+	Metadata   map[string]string `json:"metadata"`
+	Messages   []message         `json:"messages"`
+	Tools      []toolDef         `json:"tools,omitempty"`
+	ToolChoice json.RawMessage   `json:"tool_choice,omitempty"`
+}
+
+type toolDef struct {
+	Type     string       `json:"type"`
+	Function toolFunction `json:"function"`
+}
+
+type toolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 type message struct {
@@ -51,6 +67,7 @@ type output struct {
 	Manifest *manifest   `json:"manifest,omitempty"`
 	Requests []hostReq   `json:"requests,omitempty"`
 	Response *chatResp   `json:"response,omitempty"`
+	Chunk    *chatChunk  `json:"chunk,omitempty"`
 	Error    string      `json:"error,omitempty"`
 	State    interface{} `json:"state,omitempty"`
 }
@@ -75,10 +92,14 @@ type hostReq struct {
 }
 
 type httpReq struct {
+	Action    string            `json:"action,omitempty"`
+	SessionID string            `json:"session_id,omitempty"`
 	Method    string            `json:"method"`
 	URL       string            `json:"url"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	Body      string            `json:"body,omitempty"`
+	Stream    bool              `json:"stream,omitempty"`
+	ChunkSize int               `json:"chunk_size,omitempty"`
 	TimeoutMS int               `json:"timeout_ms,omitempty"`
 }
 
@@ -90,14 +111,34 @@ type hostResult struct {
 }
 
 type httpResult struct {
-	StatusCode int    `json:"status_code"`
-	Body       string `json:"body,omitempty"`
+	StatusCode int      `json:"status_code"`
+	Body       string   `json:"body,omitempty"`
+	Chunks     []string `json:"chunks,omitempty"`
+	StreamID   string   `json:"stream_id,omitempty"`
+	Done       bool     `json:"done,omitempty"`
 }
 
 type chatResp struct {
 	Content  string `json:"content"`
 	Thinking string `json:"thinking,omitempty"`
 	Raw      any    `json:"raw,omitempty"`
+}
+
+type chatChunk struct {
+	Content  string `json:"content,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+	Raw      any    `json:"raw,omitempty"`
+}
+
+type pendingStreamState struct {
+	SessionID    string         `json:"session_id,omitempty"`
+	Buffer       string         `json:"buffer,omitempty"`
+	Pending      []chatChunk    `json:"pending,omitempty"`
+	Content      string         `json:"content,omitempty"`
+	Thinking     string         `json:"thinking,omitempty"`
+	FinalMessage string         `json:"final_message,omitempty"`
+	Raw          map[string]any `json:"raw,omitempty"`
+	Done         bool           `json:"done,omitempty"`
 }
 
 var (
@@ -107,8 +148,39 @@ var (
 	xmlParamRE = regexp.MustCompile(`(?is)<parameters\s*>(.*?)</parameters\s*>`)
 )
 
+const (
+	upstreamReadChunkSize = 16 * 1024
+	streamEmitChunkRunes  = 256
+)
+
 func main() {
+	if strings.TrimSpace(os.Getenv("WEB2API_LOOP")) == "1" {
+		runLoop()
+		return
+	}
+
 	inv := readInvocation()
+	handleInvocation(inv)
+}
+
+func runLoop() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 16<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var inv invocation
+		if err := json.Unmarshal([]byte(line), &inv); err != nil {
+			write(output{Type: "error", Error: "decode invocation: " + err.Error()})
+			continue
+		}
+		handleInvocation(inv)
+	}
+}
+
+func handleInvocation(inv invocation) {
 	switch inv.Action {
 	case "plugin_info":
 		pluginInfo()
@@ -127,7 +199,7 @@ func pluginInfo() {
 		Description: "Translate Grok Web app-chat to OpenAI-compatible outputs",
 		Entry:       "chat_completions",
 		Capabilities: []string{
-			"chat", "stream", "thinking",
+			"chat", "stream", "thinking", "persistent_process",
 		},
 		Models: []map[string]any{
 			{"id": "grok-3", "name": "Grok 3"},
@@ -217,12 +289,73 @@ func chatCompletions(inv invocation) {
 			ID:   "grok-chat",
 			Kind: "http",
 			HTTP: &httpReq{
+				Action:    streamAction(inv.Input.Request.Stream, "open"),
 				Method:    "POST",
 				URL:       url,
 				Headers:   headers,
 				Body:      string(body),
+				Stream:    inv.Input.Request.Stream,
+				ChunkSize: upstreamReadChunkSize,
 				TimeoutMS: 120000,
 			},
+		}}})
+		return
+	}
+
+	if inv.Input == nil {
+		write(output{Type: "error", Error: "missing input"})
+		return
+	}
+	mode := resolveModeID(inv.Input.Request, inv.Input.Source.Metadata)
+
+	if state, ok := decodePendingStreamState(inv.State); ok {
+		if len(inv.HostResults) > 0 && inv.HostResults[0].HTTP != nil {
+			result := inv.HostResults[0]
+			if result.Error != "" {
+				write(output{Type: "error", Error: result.Error})
+				return
+			}
+			if result.HTTP.StatusCode >= 400 {
+				if result.HTTP.StatusCode == 403 {
+					write(output{Type: "error", Error: fmt.Sprintf("upstream status 403: forbidden (check access_token/cookie/user_agent validity) mode=%s body=%s", mode, sanitizePreview(result.HTTP.Body, 320))})
+					return
+				}
+				write(output{Type: "error", Error: fmt.Sprintf("upstream status %d mode=%s body=%s", result.HTTP.StatusCode, mode, sanitizePreview(result.HTTP.Body, 220))})
+				return
+			}
+			if state.Raw == nil {
+				state.Raw = map[string]any{}
+			}
+			state.Raw["mode_id"] = mode
+			state.Raw["status_code"] = result.HTTP.StatusCode
+			if strings.TrimSpace(inv.Input.Request.Metadata["debug_validate"]) == "1" {
+				state.Raw["body_preview"] = sanitizePreview(result.HTTP.Body, 420)
+			}
+			if result.HTTP.StreamID != "" {
+				state.SessionID = result.HTTP.StreamID
+			}
+			applyStreamBody(&state, result.HTTP.Body, streamEmitChunkRunes)
+			if result.HTTP.Done {
+				state.Done = true
+				finalizePendingStreamState(&state)
+			}
+		}
+		if len(state.Pending) > 0 {
+			emitPendingStreamState(state)
+			return
+		}
+		if state.Done {
+			emitFinalResponse(state)
+			return
+		}
+		if state.SessionID == "" {
+			write(output{Type: "error", Error: "stream session missing"})
+			return
+		}
+		write(output{Type: "continue", State: state, Requests: []hostReq{{
+			ID:   "grok-chat",
+			Kind: "http",
+			HTTP: &httpReq{Action: "recv", SessionID: state.SessionID, Stream: true, ChunkSize: upstreamReadChunkSize, TimeoutMS: 120000},
 		}}})
 		return
 	}
@@ -236,7 +369,6 @@ func chatCompletions(inv invocation) {
 		write(output{Type: "error", Error: result.Error})
 		return
 	}
-	mode := resolveModeID(inv.Input.Request, inv.Input.Source.Metadata)
 	if result.HTTP.StatusCode >= 400 {
 		if result.HTTP.StatusCode == 403 {
 			write(output{Type: "error", Error: fmt.Sprintf("upstream status 403: forbidden (check access_token/cookie/user_agent validity) mode=%s body=%s", mode, sanitizePreview(result.HTTP.Body, 320))})
@@ -246,40 +378,79 @@ func chatCompletions(inv invocation) {
 		return
 	}
 
-	text, thinking, toolCalls := parseGrokSSE(result.HTTP.Body)
-	if strings.TrimSpace(text) == "" {
-		text = "(empty grok response)"
+	if !inv.Input.Request.Stream {
+		rawMeta := map[string]any{}
+		if strings.TrimSpace(inv.Input.Request.Metadata["debug_validate"]) == "1" {
+			rawMeta["mode_id"] = mode
+			rawMeta["status_code"] = result.HTTP.StatusCode
+			rawMeta["body_preview"] = sanitizePreview(result.HTTP.Body, 420)
+		}
+		text, thinking, toolCalls := parseGrokSSE(result.HTTP.Body)
+		if strings.TrimSpace(text) == "" {
+			text = "(empty grok response)"
+		}
+		rawMeta["content_len"] = len(text)
+		rawMeta["thinking_len"] = len(thinking)
+		if len(toolCalls) > 0 {
+			rawMeta["tool_calls"] = toolCalls
+		}
+		resp := &chatResp{Content: text, Thinking: thinking}
+		if len(rawMeta) > 0 {
+			resp.Raw = rawMeta
+		}
+		write(output{Type: "response", Response: resp})
+		return
 	}
-	resp := &chatResp{Content: text, Thinking: thinking}
+
+	state := pendingStreamState{SessionID: result.HTTP.StreamID, Raw: map[string]any{"mode_id": mode, "status_code": result.HTTP.StatusCode}}
 	if strings.TrimSpace(inv.Input.Request.Metadata["debug_validate"]) == "1" {
-		resp.Raw = map[string]any{
-			"mode_id":      mode,
-			"status_code":  result.HTTP.StatusCode,
-			"body_preview": sanitizePreview(result.HTTP.Body, 420),
-			"content_len":  len(text),
-			"thinking_len": len(thinking),
-		}
+		state.Raw["body_preview"] = sanitizePreview(result.HTTP.Body, 420)
 	}
-	if len(toolCalls) > 0 {
-		if resp.Raw == nil {
-			resp.Raw = map[string]any{}
-		}
-		resp.Raw.(map[string]any)["tool_calls"] = toolCalls
+	applyStreamBody(&state, result.HTTP.Body, streamEmitChunkRunes)
+	if result.HTTP.Done {
+		state.Done = true
+		finalizePendingStreamState(&state)
 	}
-	write(output{Type: "response", Response: resp})
+
+	if len(state.Pending) > 0 {
+		emitPendingStreamState(state)
+		return
+	}
+	if state.Done {
+		emitFinalResponse(state)
+		return
+	}
+	if state.SessionID == "" {
+		write(output{Type: "error", Error: "stream session missing"})
+		return
+	}
+	write(output{Type: "continue", State: state, Requests: []hostReq{{
+		ID:   "grok-chat",
+		Kind: "http",
+		HTTP: &httpReq{Action: "recv", SessionID: state.SessionID, Stream: true, ChunkSize: upstreamReadChunkSize, TimeoutMS: 120000},
+	}}})
 }
 
 func extractUserMessage(messages []message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		content := parseAnyContent(messages[i].Content)
-		if messages[i].Role == "user" && strings.TrimSpace(content) != "" {
-			return strings.TrimSpace(content)
+	if len(messages) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		content := strings.TrimSpace(parseAnyContent(msg.Content))
+		if content == "" {
+			continue
 		}
+		role := strings.ToUpper(strings.TrimSpace(msg.Role))
+		if role == "" {
+			role = "USER"
+		}
+		parts = append(parts, "["+role+"]\n"+content)
 	}
-	if len(messages) > 0 {
-		return strings.TrimSpace(parseAnyContent(messages[len(messages)-1].Content))
+	if len(parts) == 0 {
+		return ""
 	}
-	return ""
+	return strings.Join(parts, "\n\n")
 }
 
 func resolveModeID(req request, metadata map[string]string) string {
@@ -362,26 +533,21 @@ func sanitizePreview(text string, max int) string {
 func parseGrokSSE(raw string) (string, string, []map[string]any) {
 	textParts := make([]string, 0, 64)
 	thinkingParts := make([]string, 0, 32)
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		}
-		if line == "" || line == "[DONE]" {
-			continue
-		}
-
+	finalMessage := ""
+	for _, chunk := range extractJSONObjects(raw) {
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+		if err := json.Unmarshal([]byte(chunk), &obj); err != nil {
 			continue
 		}
 		result, _ := obj["result"].(map[string]any)
 		resp, _ := result["response"].(map[string]any)
+		if modelResp, ok := resp["modelResponse"].(map[string]any); ok {
+			if msg, ok := modelResp["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				finalMessage = msg
+			}
+		}
 		token, _ := resp["token"].(string)
-		if strings.TrimSpace(token) == "" {
+		if token == "" {
 			continue
 		}
 		if isThinking, _ := resp["isThinking"].(bool); isThinking {
@@ -391,11 +557,194 @@ func parseGrokSSE(raw string) (string, string, []map[string]any) {
 		textParts = append(textParts, token)
 	}
 	text := strings.TrimSpace(strings.Join(textParts, ""))
+	if text == "" && strings.TrimSpace(finalMessage) != "" {
+		text = strings.TrimSpace(finalMessage)
+	}
 	toolCalls, cleaned := parseToolCalls(text)
 	if cleaned != "" {
 		text = cleaned
 	}
 	return text, strings.TrimSpace(strings.Join(thinkingParts, "")), toolCalls
+}
+
+func decodePendingStreamState(raw json.RawMessage) (pendingStreamState, bool) {
+	if len(raw) == 0 {
+		return pendingStreamState{}, false
+	}
+	var state pendingStreamState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return pendingStreamState{}, false
+	}
+	return state, true
+}
+
+func emitPendingStreamState(state pendingStreamState) {
+	if len(state.Pending) > 0 {
+		chunk := state.Pending[0]
+		state.Pending = state.Pending[1:]
+		write(output{Type: "chunk", Chunk: &chunk, State: state})
+		return
+	}
+	emitFinalResponse(state)
+}
+
+func emitFinalResponse(state pendingStreamState) {
+	if strings.TrimSpace(state.Content) == "" && strings.TrimSpace(state.FinalMessage) != "" {
+		state.Content = strings.TrimSpace(state.FinalMessage)
+	}
+	toolCalls, cleaned := parseToolCalls(state.Content)
+	if cleaned != "" {
+		state.Content = cleaned
+	}
+	if state.Raw == nil {
+		state.Raw = map[string]any{}
+	}
+	state.Raw["content_len"] = len(state.Content)
+	state.Raw["thinking_len"] = len(state.Thinking)
+	if len(toolCalls) > 0 {
+		state.Raw["tool_calls"] = toolCalls
+	}
+	resp := &chatResp{Content: state.Content, Thinking: state.Thinking}
+	if len(state.Raw) > 0 {
+		resp.Raw = state.Raw
+	}
+	write(output{Type: "response", Response: resp})
+}
+
+func streamAction(enabled bool, action string) string {
+	if !enabled {
+		return ""
+	}
+	return action
+}
+
+func applyStreamBody(state *pendingStreamState, part string, maxRunes int) {
+	if maxRunes <= 0 {
+		maxRunes = 24
+	}
+	state.Buffer += part
+	objects, remain := extractJSONObjectsWithRemainder(state.Buffer)
+	state.Buffer = remain
+	for _, objRaw := range objects {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(objRaw), &obj); err != nil {
+			continue
+		}
+		result, _ := obj["result"].(map[string]any)
+		resp, _ := result["response"].(map[string]any)
+		if modelResp, ok := resp["modelResponse"].(map[string]any); ok {
+			if msg, ok := modelResp["message"].(string); ok && strings.TrimSpace(msg) != "" {
+				state.FinalMessage = msg
+			}
+		}
+		token, _ := resp["token"].(string)
+		if token == "" {
+			continue
+		}
+		isThinking, _ := resp["isThinking"].(bool)
+		appendTokenChunk(state, token, isThinking, maxRunes)
+	}
+}
+
+func finalizePendingStreamState(state *pendingStreamState) {
+	if strings.TrimSpace(state.Content) == "" && strings.TrimSpace(state.FinalMessage) != "" {
+		state.Content = strings.TrimSpace(state.FinalMessage)
+	}
+}
+
+func appendTokenChunk(state *pendingStreamState, token string, isThinking bool, maxRunes int) {
+	if len([]rune(token)) > maxRunes {
+		r := []rune(token)
+		for i := 0; i < len(r); i += maxRunes {
+			end := i + maxRunes
+			if end > len(r) {
+				end = len(r)
+			}
+			appendTokenChunk(state, string(r[i:end]), isThinking, maxRunes)
+		}
+		return
+	}
+	if len(state.Pending) == 0 {
+		if isThinking {
+			state.Pending = append(state.Pending, chatChunk{Thinking: token})
+		} else {
+			state.Pending = append(state.Pending, chatChunk{Content: token})
+		}
+		return
+	}
+	idx := len(state.Pending) - 1
+	last := state.Pending[idx]
+	if isThinking {
+		if last.Thinking != "" && len([]rune(last.Thinking))+len([]rune(token)) <= maxRunes {
+			state.Pending[idx].Thinking += token
+		} else {
+			state.Pending = append(state.Pending, chatChunk{Thinking: token})
+		}
+		return
+	}
+	if last.Content != "" && len([]rune(last.Content))+len([]rune(token)) <= maxRunes {
+		state.Pending[idx].Content += token
+	} else {
+		state.Pending = append(state.Pending, chatChunk{Content: token})
+	}
+}
+
+func extractJSONObjects(raw string) []string {
+	items, _ := extractJSONObjectsWithRemainder(raw)
+	return items
+}
+
+func extractJSONObjectsWithRemainder(raw string) ([]string, string) {
+	items := make([]string, 0, 256)
+	start := -1
+	depth := 0
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if start < 0 {
+			if ch == '{' {
+				start = i
+				depth = 1
+				inString = false
+				escaped = false
+			}
+			continue
+		}
+
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				items = append(items, raw[start:i+1])
+				start = -1
+			}
+		}
+	}
+	if start >= 0 {
+		return items, raw[start:]
+	}
+	return items, ""
 }
 
 func parseAnyContent(value any) string {
@@ -464,5 +813,5 @@ func readInvocation() invocation {
 
 func write(v any) {
 	b, _ := json.Marshal(v)
-	fmt.Print(string(b))
+	fmt.Print(string(b) + "\n")
 }

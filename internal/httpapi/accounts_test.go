@@ -11,7 +11,6 @@ import (
 	"web2api/internal/account"
 	"web2api/internal/consumer"
 	"web2api/internal/plugin"
-	"web2api/internal/source"
 	"web2api/internal/testutil"
 )
 
@@ -23,10 +22,9 @@ func TestAdminAccountsLifecycle(t *testing.T) {
 	if err := mgr.Scan(); err != nil {
 		t.Fatal(err)
 	}
-	sources, _ := source.NewStore(filepath.Join(t.TempDir(), "sources.json"))
 	accounts, _ := account.NewStore(filepath.Join(t.TempDir(), "accounts.json"))
 	consumers, _ := consumer.NewStore(filepath.Join(t.TempDir(), "consumers.json"))
-	router := NewHandler(mgr, sources, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
+	router := NewHandler(mgr, accounts, consumers, filepath.Join(testutil.ProjectRoot(t), "web")).Router()
 
 	body, _ := json.Marshal(map[string]any{"id": "acc-1", "plugin_id": "echo", "models": []string{"grok-test-model"}, "name": "Primary", "status": "active", "fields": map[string]string{"access_token": "token-1"}})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/accounts", bytes.NewReader(body))

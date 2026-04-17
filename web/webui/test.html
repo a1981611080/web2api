@@ -9,8 +9,14 @@
     .wrap { max-width: 960px; margin: 0 auto; }
     .panel { background: #0f172a; border: 1px solid #1e293b; border-radius: 14px; padding: 20px; }
     textarea, input, select { width: 100%; box-sizing: border-box; margin-top: 8px; margin-bottom: 14px; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #111827; color: #fff; }
+    input[type="checkbox"] { width: auto; margin: 0 8px 0 0; padding: 0; border: 0; vertical-align: middle; }
+    .checkbox-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
+    .checkbox-row span { color: #dbe7ff; }
     button { background: #22c55e; color: #04130a; border: 0; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-weight: bold; }
-    pre { white-space: pre-wrap; word-break: break-word; background: #000; padding: 12px; border-radius: 8px; min-height: 200px; }
+    .output { white-space: normal; word-break: break-word; background: #000; padding: 12px; border-radius: 8px; min-height: 200px; line-height: 1.6; }
+    .output p { margin: 0 0 10px; }
+    .output code { background: #111827; padding: 2px 6px; border-radius: 6px; }
+    .output pre { background: #111827; padding: 10px; border-radius: 8px; overflow: auto; }
   </style>
 </head>
 <body>
@@ -27,14 +33,14 @@
       <label>消息</label>
       <textarea id="message" rows="6">你好，介绍一下你自己</textarea>
 
-      <label><input type="checkbox" id="stream" checked> 流式返回</label>
-      <label><input type="checkbox" id="thinking"> thinking 输出</label>
+      <label class="checkbox-row"><input type="checkbox" id="stream" checked><span>流式返回</span></label>
+      <label class="checkbox-row"><input type="checkbox" id="thinking"><span>thinking 输出</span></label>
 
       <div style="margin-top: 12px; margin-bottom: 12px;">
         <button id="send">发送</button>
       </div>
 
-      <pre id="output"></pre>
+      <div id="output" class="output"></div>
     </div>
   </div>
 
@@ -42,6 +48,121 @@
     const output = document.getElementById('output');
     const modelSelect = document.getElementById('model');
     const apiKeyInput = document.getElementById('api-key');
+
+    let typingQueue = Promise.resolve();
+    let markdownText = '';
+
+    function escapeHTML(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function markdownToHTML(md) {
+      const escaped = escapeHTML(md || '');
+      const codeBlocks = [];
+      let html = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
+        const token = `__CODE_BLOCK_${codeBlocks.length}__`;
+        codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+        return token;
+      });
+
+      html = html
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\[(.+?)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+      const lines = html.split('\n');
+      const blocks = [];
+      let listOpen = false;
+      const closeList = () => {
+        if (listOpen) {
+          blocks.push('</ul>');
+          listOpen = false;
+        }
+      };
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) {
+          closeList();
+          continue;
+        }
+        if (/^__CODE_BLOCK_\d+__$/.test(line)) {
+          closeList();
+          blocks.push(line);
+          continue;
+        }
+
+        const h3 = line.match(/^###\s+(.+)$/);
+        if (h3) {
+          closeList();
+          blocks.push(`<h3>${h3[1]}</h3>`);
+          continue;
+        }
+        const h2 = line.match(/^##\s+(.+)$/);
+        if (h2) {
+          closeList();
+          blocks.push(`<h2>${h2[1]}</h2>`);
+          continue;
+        }
+        const h1 = line.match(/^#\s+(.+)$/);
+        if (h1) {
+          closeList();
+          blocks.push(`<h1>${h1[1]}</h1>`);
+          continue;
+        }
+
+        const li = line.match(/^[-*]\s+(.+)$/);
+        if (li) {
+          if (!listOpen) {
+            blocks.push('<ul>');
+            listOpen = true;
+          }
+          blocks.push(`<li>${li[1]}</li>`);
+          continue;
+        }
+
+        closeList();
+        blocks.push(`<p>${line}</p>`);
+      }
+      closeList();
+
+      html = blocks.join('');
+      codeBlocks.forEach((block, idx) => {
+        html = html.replace(`__CODE_BLOCK_${idx}__`, block);
+      });
+      return html;
+    }
+
+    function renderMarkdown() {
+      output.innerHTML = markdownToHTML(markdownText);
+    }
+
+    function enqueueType(text) {
+      typingQueue = typingQueue.then(() => typeText(text));
+      return typingQueue;
+    }
+
+    async function typeText(text) {
+      const chunkSize = text.length > 60 ? 2 : 1;
+      for (let i = 0; i < text.length; i += chunkSize) {
+        markdownText += text.slice(i, i + chunkSize);
+        renderMarkdown();
+        await new Promise((resolve) => setTimeout(resolve, 12));
+      }
+    }
+
+    function parseJSONSafe(text) {
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        return null;
+      }
+    }
 
     async function loadModels() {
       const headers = {};
@@ -62,7 +183,9 @@
     });
 
     document.getElementById('send').addEventListener('click', async () => {
-      output.textContent = '';
+      markdownText = '';
+      renderMarkdown();
+      typingQueue = Promise.resolve();
 
       const payload = {
         model: modelSelect.value,
@@ -85,16 +208,45 @@
       });
 
       if (!payload.stream) {
-        output.textContent = JSON.stringify(await res.json(), null, 2);
+        const data = await res.json();
+        if (!res.ok) {
+          markdownText = `请求失败: ${data && data.error && data.error.message ? data.error.message : 'unknown error'}`;
+          renderMarkdown();
+          return;
+        }
+        const text = data && data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+        markdownText = text || '(无文本返回)';
+        renderMarkdown();
         return;
       }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        output.textContent += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          const obj = parseJSONSafe(data);
+          if (!obj) continue;
+          const choices = obj.choices || [];
+          const delta = choices[0] && choices[0].delta ? choices[0].delta : {};
+          if (typeof delta.content === 'string' && delta.content) {
+            await enqueueType(delta.content);
+          }
+        }
+      }
+      await typingQueue;
+      if (!markdownText.trim()) {
+        markdownText = '(流式结束，但没有文本片段)';
+        renderMarkdown();
       }
     });
 
