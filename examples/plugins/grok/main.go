@@ -202,9 +202,9 @@ func pluginInfo() {
 			"chat", "stream", "thinking", "persistent_process",
 		},
 		Models: []map[string]any{
-			{"id": "grok-3", "name": "Grok 3"},
-			{"id": "grok-3-mini", "name": "Grok 3 Mini"},
-			{"id": "grok-3-reasoning", "name": "Grok 3 Reasoning"},
+			{"id": "auto", "name": "Auto"},
+			{"id": "fast", "name": "Fast"},
+			{"id": "expert", "name": "Expert"},
 		},
 		AccountFields: []map[string]any{
 			{"key": "access_token", "label": "SSO Access Token", "type": "text", "required": true, "secret": true, "placeholder": "sso token value"},

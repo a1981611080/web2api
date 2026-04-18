@@ -488,6 +488,16 @@
           <label>客户端<select id="client-select"><option value="">无（仅无鉴权时可用）</option></select></label>
           <label>模型<select id="model-select"></select></label>
           <label>消息<textarea id="message" rows="7">你好，介绍一下你自己</textarea></label>
+          <label>工具调用策略
+            <select id="tool-choice">
+              <option value="">不启用工具</option>
+              <option value="auto">auto</option>
+              <option value="required">required</option>
+            </select>
+          </label>
+          <label>Tools(JSON)
+            <textarea id="tools-json" rows="8" placeholder='[{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"filePath":{"type":"string"}},"required":["filePath"]}}}]'></textarea>
+          </label>
           <label class="checkbox-row"><input type="checkbox" id="stream" checked><span>流式返回</span></label>
           <label class="checkbox-row"><input type="checkbox" id="thinking"><span>thinking 输出</span></label>
           <div class="toolbar">
@@ -542,6 +552,20 @@
         thinking: document.getElementById('thinking').checked,
         messages: [{ role: 'user', content: document.getElementById('message').value }]
       };
+      const toolChoice = document.getElementById('tool-choice').value;
+      const toolsRaw = (document.getElementById('tools-json').value || '').trim();
+      if (toolChoice) {
+        payload.tool_choice = toolChoice;
+      }
+      if (toolsRaw) {
+        try {
+          payload.tools = JSON.parse(toolsRaw);
+        } catch (e) {
+          output.textContent = `tools JSON 解析失败: ${String(e)}`;
+          rendered.innerHTML = markdownToHTML('(tools JSON 无效)');
+          return;
+        }
+      }
       const res = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -686,7 +710,7 @@
           <h3>${escapeHTML(item.model || '-')} <span class="pill">${escapeHTML(item.finish_reason || '-')}</span></h3>
           <div class="muted">at: ${escapeHTML(item.at || '-')} | request_id: ${escapeHTML(item.request_id || '-')}</div>
           <div class="muted">stream: ${item.stream ? 'true' : 'false'} | tool_choice: ${escapeHTML(item.tool_choice || '-')} | tools: ${escapeHTML(item.tool_count || 0)} | tool_calls: ${escapeHTML(item.tool_calls || 0)}</div>
-          ${item.request_preview ? `<pre style="margin-top:8px;white-space:pre-wrap;">request: ${escapeHTML(item.request_preview)}</pre>` : ''}
+          ${item.upstream_message ? `<pre style="margin-top:8px;white-space:pre-wrap;">upstream_message: ${escapeHTML(item.upstream_message)}</pre>` : ''}
           ${item.error ? `<div class="muted" style="margin-top:8px;color:#fecaca;">error: ${escapeHTML(item.error)}</div>` : ''}
           ${item.content_preview ? `<div class="muted" style="margin-top:8px;">content: ${escapeHTML(item.content_preview)}</div>` : ''}
           ${item.raw_preview ? `<pre style="margin-top:8px;white-space:pre-wrap;">${escapeHTML(item.raw_preview)}</pre>` : ''}

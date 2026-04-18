@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -36,18 +36,18 @@ func NewHandler(plugins *plugin.Manager, accounts *account.Store, consumers *con
 }
 
 type toolCallLogEntry struct {
-	At         string `json:"at"`
-	RequestID  string `json:"request_id,omitempty"`
-	Model      string `json:"model"`
-	Stream     bool   `json:"stream"`
-	ToolChoice string `json:"tool_choice,omitempty"`
-	ToolCount  int    `json:"tool_count"`
-	Request    string `json:"request_preview,omitempty"`
-	Finish     string `json:"finish_reason,omitempty"`
-	ToolCalls  int    `json:"tool_calls"`
-	Content    string `json:"content_preview,omitempty"`
-	Raw        string `json:"raw_preview,omitempty"`
-	Error      string `json:"error,omitempty"`
+	At              string `json:"at"`
+	RequestID       string `json:"request_id,omitempty"`
+	Model           string `json:"model"`
+	Stream          bool   `json:"stream"`
+	ToolChoice      string `json:"tool_choice,omitempty"`
+	ToolCount       int    `json:"tool_count"`
+	UpstreamMessage string `json:"upstream_message,omitempty"`
+	Finish          string `json:"finish_reason,omitempty"`
+	ToolCalls       int    `json:"tool_calls"`
+	Content         string `json:"content_preview,omitempty"`
+	Raw             string `json:"raw_preview,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
 
 func (h *Handler) Router() chi.Router {
@@ -594,9 +594,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	effectiveReq := req
 	if len(req.Tools) > 0 {
-		instruction := buildToolSystemInstruction(req.Tools, req.ToolChoice)
-		if strings.TrimSpace(instruction) != "" {
-			effectiveReq.Messages = append([]chatMessage{{Role: "system", Content: instruction}}, req.Messages...)
+		head := buildToolSystemInstructionHead(req.Tools)
+		tail := buildToolSystemInstructionTail(req.ToolChoice)
+		if strings.TrimSpace(head) != "" {
+			effectiveReq.Messages = append([]chatMessage{{Role: "system", Content: head}}, effectiveReq.Messages...)
+		}
+		if strings.TrimSpace(tail) != "" {
+			effectiveReq.Messages = append(effectiveReq.Messages, chatMessage{Role: "system", Content: tail})
 		}
 	}
 	if effectiveReq.Stream {
@@ -612,17 +616,51 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		streamedContent := ""
 		streamedThinking := ""
 		hasChunk := false
+		deferVisibleStream := true
+		allowEarlyFlush := len(req.Tools) == 0
+		type pendingStreamEvent struct {
+			kind string
+			text string
+		}
+		pendingEvents := make([]pendingStreamEvent, 0, 32)
+		flushPending := func() {
+			for _, evt := range pendingEvents {
+				switch evt.kind {
+				case "thinking":
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning":%q}}]}`, evt.text))
+				case "content":
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, evt.text))
+				}
+				flusher.Flush()
+			}
+			pendingEvents = pendingEvents[:0]
+		}
 		src, selection, result, err := h.executeChatPipelineStream(r, effectiveReq, consumerCfg, func(chunk plugin.ChatCompletionChunk) error {
 			hasChunk = true
 			if chunk.Thinking != "" {
 				streamedThinking += chunk.Thinking
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning":%q}}]}`, chunk.Thinking))
-				flusher.Flush()
+				if deferVisibleStream {
+					pendingEvents = append(pendingEvents, pendingStreamEvent{kind: "thinking", text: chunk.Thinking})
+				} else {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"thinking","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning":%q}}]}`, chunk.Thinking))
+					flusher.Flush()
+				}
 			}
 			if chunk.Content != "" {
 				streamedContent += chunk.Content
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, chunk.Content))
-				flusher.Flush()
+				if deferVisibleStream {
+					pendingEvents = append(pendingEvents, pendingStreamEvent{kind: "content", text: chunk.Content})
+					if allowEarlyFlush {
+						first := firstNonWhitespaceRune(streamedContent)
+						if first != 0 && first != '{' {
+							deferVisibleStream = false
+							flushPending()
+						}
+					}
+				} else {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, chunk.Content))
+					flusher.Flush()
+				}
 			}
 			return nil
 		})
@@ -642,7 +680,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = src
 		_ = selection
-		toolCalls := extractToolCalls(result.Raw)
+		toolCalls := extractToolCallsFromResult(result)
 		if len(req.Tools) > 0 {
 			finishLog := "stop"
 			if len(toolCalls) > 0 {
@@ -657,11 +695,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return
 		}
-		if !hasChunk {
-			if len(toolCalls) > 0 {
-				streamChatCompletionToolCalls(w, effectiveReq.Model, toolCalls)
+		if len(toolCalls) > 0 {
+			streamChatCompletionToolCalls(w, effectiveReq.Model, toolCalls)
+			return
+		}
+		if deferVisibleStream {
+			jsonLike := firstNonWhitespaceRune(result.Content) == '{' || (hasChunk && firstNonWhitespaceRune(streamedContent) == '{')
+			if jsonLike {
+				if len(req.Tools) > 0 {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"chunk","object":"chat.completion.chunk","model":%q,"choices":[{"index":0,"delta":{"content":%q}}]}`, effectiveReq.Model, "[tool error] json-like tool output detected but no valid tool_calls parsed"))
+					_, _ = fmt.Fprint(w, "data: {\"id\":\"done\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+					_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+					flusher.Flush()
+					return
+				}
+			}
+			if hasChunk {
+				flushPending()
+				_, _ = fmt.Fprint(w, "data: {\"id\":\"done\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				flusher.Flush()
 				return
 			}
+			streamChatCompletion(w, effectiveReq.Model, result.Content, result.Thinking)
+			return
+		}
+		if !hasChunk {
 			streamChatCompletion(w, effectiveReq.Model, result.Content, result.Thinking)
 			return
 		}
@@ -698,7 +757,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	toolCalls := extractToolCalls(result.Raw)
+	toolCalls := extractToolCallsFromResult(result)
 	if len(req.Tools) > 0 {
 		finishLog := "stop"
 		if len(toolCalls) > 0 {
@@ -919,7 +978,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	toolCalls := extractToolCalls(result.Raw)
+	toolCalls := extractToolCallsFromResult(result)
 	outputItems := make([]map[string]any, 0, len(toolCalls)+1)
 	if len(toolCalls) > 0 {
 		for _, tc := range toolCalls {
@@ -1080,17 +1139,18 @@ func missingRequiredFields(values map[string]string, required []string) []string
 	return missing
 }
 
-func buildToolSystemInstruction(tools []chatTool, toolChoice any) string {
+func buildToolSystemInstructionHead(tools []chatTool) string {
 	if len(tools) == 0 {
 		return ""
 	}
 	compact := compactToolsForPrompt(tools)
 	b, _ := json.Marshal(compact)
-	choice := toolChoiceString(toolChoice)
-	if strings.TrimSpace(choice) == "" {
-		choice = "auto"
-	}
-	return "[Tool Calling Contract]\nYou MUST only use tools listed in available_tools; never invent tool names.\nIf tool is NOT needed, answer normally in plain text.\nIf tool IS needed, output ONLY XML and nothing else: <tool_calls><tool_call><tool_name>NAME</tool_name><parameters>{JSON}</parameters></tool_call></tool_calls>.\nDo not claim tool execution in natural language.\nFor tool_choice=required you must return tool XML; for tool_choice=auto choose based on necessity.\ntool_choice=" + choice + "\navailable_tools=" + string(b)
+	return "[SYSTEM]\nWhen you need to use a tool, please output the tool invocation strictly in the specified JSON format without adding any additional text explanations. The format is as follows:\n{\n  \"tool_calls\": {\n    \"tool_name\": \"Tool Name\",\n    \"parameters\": {\n      \"Parameter Name 1\": \"Parameter Value 1\",\n      \"Parameter Name 2\": \"Parameter Value 2\"\n    }\n  }\n}\nThe list of tools you can use is as follows:\n" + string(b)
+}
+
+func buildToolSystemInstructionTail(toolChoice any) string {
+	_ = toolChoice
+	return "[SYSTEM]\nYou are a powerful AI assistant equipped with the following practical tools that can help you better complete user tasks.\nYou must completely comply with the following rules for output:\n1. In any case, if it is possible to use the provided tools to answer the question, do so unless there is truly no tool available; otherwise, the tool must be used.\n2. If a tool is required, only output the tool invocation in JSON format and do not include any other text.\n3. Only use the available tool list.\n4. If no tool is needed, reply to the user with plain text as usual."
 }
 
 func compactToolsForPrompt(tools []chatTool) []map[string]any {
@@ -1168,9 +1228,7 @@ func (h *Handler) appendToolCallLog(r *http.Request, req chatCompletionRequest, 
 		Finish:     finish,
 		ToolCalls:  len(calls),
 	}
-	if b, marshalErr := json.Marshal(req); marshalErr == nil {
-		entry.Request = string(b)
-	}
+	entry.UpstreamMessage = buildGrokMessageProjection(req.Messages)
 	if err != nil {
 		entry.Error = err.Error()
 	}
@@ -1189,9 +1247,25 @@ func (h *Handler) appendToolCallLog(r *http.Request, req chatCompletionRequest, 
 		h.toolLogs = h.toolLogs[:200]
 	}
 	h.toolLogMu.Unlock()
+}
 
-	log.Printf("tool-call trace=%s model=%s stream=%v choice=%s tools=%d finish=%s calls=%d request=%q err=%s content=%q raw=%q",
-		entry.RequestID, entry.Model, entry.Stream, entry.ToolChoice, entry.ToolCount, entry.Finish, entry.ToolCalls, entry.Request, entry.Error, entry.Content, entry.Raw)
+func buildGrokMessageProjection(messages []chatMessage) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		content := strings.TrimSpace(parseResponseContent(msg.Content))
+		if content == "" {
+			continue
+		}
+		role := strings.ToUpper(strings.TrimSpace(msg.Role))
+		if role == "" {
+			role = "USER"
+		}
+		parts = append(parts, "["+role+"]\n"+content)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func toolChoiceString(choice any) string {
@@ -1623,6 +1697,72 @@ type toolCall struct {
 	Arguments string
 }
 
+func extractToolCallsFromResult(result plugin.ChatCompletionResult) []toolCall {
+	if calls := extractToolCalls(result.Raw); len(calls) > 0 {
+		return calls
+	}
+	return extractToolCallsFromContent(result.Content)
+}
+
+func extractToolCallsFromContent(content string) []toolCall {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return nil
+	}
+	trimmed = strings.TrimPrefix(trimmed, "```json")
+	trimmed = strings.TrimPrefix(trimmed, "```")
+	trimmed = strings.TrimSuffix(trimmed, "```")
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" {
+		return nil
+	}
+	first := trimmed[0]
+	if first != '{' && first != '[' {
+		return nil
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return nil
+	}
+	obj, ok := parsed.(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawCalls, ok := obj["tool_calls"]
+	if !ok {
+		return nil
+	}
+
+	out := make([]toolCall, 0, 4)
+	appendCall := func(name string, params any, index int) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		args := "{}"
+		if params != nil {
+			if b, err := json.Marshal(params); err == nil {
+				args = string(b)
+			}
+		}
+		out = append(out, toolCall{ID: fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), index), Name: name, Arguments: args})
+	}
+
+	switch v := rawCalls.(type) {
+	case map[string]any:
+		appendCall(fmt.Sprint(v["tool_name"]), v["parameters"], 0)
+	case []any:
+		for i, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			appendCall(fmt.Sprint(m["tool_name"]), m["parameters"], i)
+		}
+	}
+	return out
+}
+
 func extractToolCalls(raw any) []toolCall {
 	obj, ok := raw.(map[string]any)
 	if !ok {
@@ -1709,6 +1849,16 @@ func splitTextForStream(text string, maxRunes int) []string {
 		out = append(out, string(runes[i:end]))
 	}
 	return out
+}
+
+func firstNonWhitespaceRune(text string) rune {
+	for _, r := range text {
+		if unicode.IsSpace(r) || r == '\ufeff' || r == '\u200b' || r == '\u200c' || r == '\u200d' || r == '\u2060' {
+			continue
+		}
+		return r
+	}
+	return 0
 }
 
 func streamResponses(w http.ResponseWriter, model string, answer string, thinking string) {
