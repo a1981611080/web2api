@@ -73,6 +73,7 @@ jobs:
           mkdir -p package/web2api
           cp "dist/${{ matrix.binary }}" package/web2api/
           cp -r plugins package/web2api/
+          cp -r web package/web2api/
           cd package
           zip -r "../dist/${{ matrix.artifact }}.zip" web2api
 
