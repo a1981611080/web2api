@@ -2,3 +2,6 @@ data/accounts.json
 data/consumers.json
 data/sources.json
 plugins/yuanbao-browser.wasm
+README_dev.md
+plugins/echo.wasm
+plugins/http_continue.wasm
