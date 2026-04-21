@@ -43,6 +43,7 @@ type Manifest struct {
 type Response struct {
 	Content  string `json:"content"`
 	Thinking string `json:"thinking,omitempty"`
+	Raw      any    `json:"raw,omitempty"`
 }
 
 func pluginInfo() {
@@ -122,6 +123,9 @@ GOOS=wasip1 GOARCH=wasm go build -o plugins/example.wasm ./plugin
 - Keep account scheduling out of plugins
 - Return deterministic JSON for admin discovery
 - Keep source-specific protocol logic inside the plugin
+- Do not inject tool policy/system prompts from plugin code
+- Read `input.request.tools` and `input.request.tool_choice` when present
+- If upstream has tool-call structure, keep it in `response.raw` for platform conversion
 
 ## Suggested Next Exports
 

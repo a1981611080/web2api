@@ -14,7 +14,7 @@ Go-based Web-to-OpenAI API platform with WASM plugin support.
 - client registry in `data/consumers.json`
 - plugin model catalog endpoint at `/api/admin/catalog/models`
 - admin page at `/admin`
-- admin subpages at `/admin/plugins`, `/admin/sources`, `/admin/accounts`, `/admin/clients`, `/admin/test`, `/admin/status`
+- admin subpages at `/admin/plugins`, `/admin/accounts`, `/admin/clients`, `/admin/test`, `/admin/status`, `/admin/runtime`, `/admin/tool-calls`
 - web UI at `/webui`
 - API test page at `/webui/test`
 - OpenAI-style `GET /v1/models`
@@ -22,7 +22,7 @@ Go-based Web-to-OpenAI API platform with WASM plugin support.
 - OpenAI-style `POST /v1/completions`
 - OpenAI-style `POST /v1/responses`
 - OpenAI-style `POST /v1/chat/completions`
-- streaming SSE placeholder and thinking placeholder
+- OpenAI-compatible tool-call bridging for `chat.completions` (non-stream + stream)
 - plugin spec and plugin development docs (`docs/plugin-spec.md`, `docs/plugin-dev.md`, `docs/plugin-ai-guide.md`, `docs/plugin-prompt-template.md`, `docs/plugin-checklist.md`)
 
 ## Run

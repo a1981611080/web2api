@@ -13,6 +13,7 @@ The plugin must:
 - declare required account fields
 - translate source-specific Web protocol into platform responses
 - ask the platform to perform `http/https/wss` work instead of opening sockets directly
+- accept tool context (`tools`, `tool_choice`) from request input without owning prompt policy
 
 ## Required Actions
 
@@ -106,6 +107,23 @@ Instead:
 - declare models in `manifest.models`
 - the platform will read them
 - the source config chooses which declared models are enabled
+
+For Grok plugin alignment, current model IDs are:
+
+- `auto`
+- `fast`
+- `expert`
+
+## Tool Calling Rules
+
+Tool policy prompting is platform-owned. Plugin should not inject its own tool policy/system prompt.
+
+Plugin behavior should be:
+
+- read `input.request.tools` and `input.request.tool_choice` when present
+- preserve upstream tool-call signal in `response.raw` (for platform parser)
+- avoid rewriting tool-call JSON into explanatory text
+- for stream mode, emit chunks normally; the platform decides what is forwarded to API clients
 
 ## Host Networking
 

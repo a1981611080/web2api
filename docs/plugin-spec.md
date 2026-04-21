@@ -53,7 +53,7 @@ Contract:
 - if plugin needs network access, it returns `type: "continue"` plus host requests
 - platform executes those requests and reinvokes the plugin with `host_results`
 
-This keeps plugins focused on source translation while the platform owns networking, retries, cookies, accounts, and scheduling.
+This keeps plugins focused on source translation while the platform owns networking, retries, cookies, accounts, scheduling, and tool-call instruction prompting.
 
 ### Invocation Shape
 
@@ -67,6 +67,23 @@ This keeps plugins focused on source translation while the platform owns network
       "model": "grok-4",
       "stream": true,
       "thinking": true,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "filePath": {"type": "string"}
+              },
+              "required": ["filePath"]
+            }
+          }
+        }
+      ],
+      "tool_choice": "required",
       "messages": [
         {"role": "user", "content": "hello"}
       ]
@@ -107,6 +124,28 @@ Plugin may return a final response:
   }
 }
 ```
+
+For tool-call bridging (non-native upstream), plugin can include parsed or upstream hints in `response.raw`, for example:
+
+```json
+{
+  "type": "response",
+  "response": {
+    "content": "",
+    "raw": {
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read",
+          "arguments": {"filePath": "C:\\repo\\hello.go"}
+        }
+      ]
+    }
+  }
+}
+```
+
+The platform converts tool-call results to OpenAI-compatible `message.tool_calls` (non-stream) and `delta.tool_calls` (stream).
 
 Or request host work and continue:
 

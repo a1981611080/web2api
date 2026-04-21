@@ -52,6 +52,9 @@ For action `chat_completions`:
 - If network is needed, return `type: "continue"` with `requests`
 - On resume (`host_results` present), continue state machine and eventually return `type: "response"`
 - Include `thinking` when request has thinking enabled
+- Parse and preserve `input.request.tools` and `input.request.tool_choice` when present
+- Do not add plugin-owned tool policy prompts; platform owns tool instruction prompts
+- Preserve upstream tool-call hints in `response.raw` so platform can output OpenAI `tool_calls`
 
 ### Output Constraints
 

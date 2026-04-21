@@ -45,6 +45,8 @@ Use this checklist to validate any generated plugin before putting it in `plugin
 - [ ] Incoming `model` is validated against supported models
 - [ ] Unsupported models return clear plugin error
 - [ ] Thinking output behavior matches capability declaration
+- [ ] Tool-context fields (`tools`, `tool_choice`) are accepted without plugin-side prompt hijacking
+- [ ] Upstream tool-call hints are preserved in `response.raw` for platform parser
 
 ## G. Error Quality
 
@@ -61,10 +63,11 @@ Use this checklist to validate any generated plugin before putting it in `plugin
 ## I. Platform Integration
 
 - [ ] Plugin visible in `/admin/plugins` as `ready`
-- [ ] Declared models visible and selectable in `/admin/sources`
+- [ ] Declared models visible via `/api/admin/catalog/models`
 - [ ] Declared account fields rendered in `/admin/accounts`
 - [ ] `GET /v1/models` includes enabled plugin models
 - [ ] `POST /v1/chat/completions` succeeds with configured account
+- [ ] In tools stream mode, output is `delta.tool_calls` + `finish_reason=tool_calls` without leaked thinking/content chunks
 
 ## J. Regression Tests (Recommended)
 
