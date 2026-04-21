@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -9,9 +10,15 @@ import (
 )
 
 func main() {
+	port := flag.String("p", "", "listen port")
+	flag.Parse()
+
 	addr := os.Getenv("WEB2API_ADDR")
 	if addr == "" {
 		addr = ":8080"
+	}
+	if *port != "" {
+		addr = ":" + *port
 	}
 
 	server, err := app.New()

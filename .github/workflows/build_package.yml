@@ -15,33 +15,43 @@ jobs:
           - goos: linux
             goarch: 386
             artifact: web2api-linux-386
+            binary: web2api
           - goos: linux
             goarch: amd64
             artifact: web2api-linux-amd64
+            binary: web2api
           - goos: linux
             goarch: arm64
             artifact: web2api-linux-arm64
+            binary: web2api
           - goos: linux
             goarch: arm
             artifact: web2api-linux-arm
+            binary: web2api
           - goos: windows
             goarch: 386
-            artifact: web2api-windows-386.exe
+            artifact: web2api-windows-386
+            binary: web2api.exe
           - goos: windows
             goarch: amd64
-            artifact: web2api-windows-amd64.exe
+            artifact: web2api-windows-amd64
+            binary: web2api.exe
           - goos: windows
             goarch: arm64
-            artifact: web2api-windows-arm64.exe
+            artifact: web2api-windows-arm64
+            binary: web2api.exe
           - goos: windows
             goarch: arm
-            artifact: web2api-windows-arm.exe
+            artifact: web2api-windows-arm
+            binary: web2api.exe
           - goos: darwin
             goarch: amd64
             artifact: web2api-darwin-amd64
+            binary: web2api
           - goos: darwin
             goarch: arm64
             artifact: web2api-darwin-arm64
+            binary: web2api
 
     steps:
       - uses: actions/checkout@v4
@@ -55,12 +65,21 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.artifact }}" ./cmd/web2api
+        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.binary }}" ./cmd/web2api
+
+      - name: Package ${{ matrix.artifact }}
+        run: |
+          rm -rf package
+          mkdir -p package/web2api
+          cp "dist/${{ matrix.binary }}" package/web2api/
+          cp -r plugins package/web2api/
+          cd package
+          zip -r "../dist/${{ matrix.artifact }}.zip" web2api
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.artifact }}
+          files: dist/${{ matrix.artifact }}.zip
 
       - name: Cleanup old releases and tags
         env:
